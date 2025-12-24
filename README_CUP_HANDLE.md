@@ -2,6 +2,20 @@
 
 株価チャートから「カップウィズハンドル（Cup with Handle）」パターンを自動検出するアプリケーションです。
 
+## バージョン情報
+
+### V2（長期パターン対応版） - **推奨**
+- **対象**: 数年〜数十年レベルの大規模パターン
+- **タイムフレーム**: 3ヶ月足（四半期足）
+- **対象銘柄**: インデックス、コモディティ、債券ETF（SLV, GLD, SPY, QQQ, TLT など）
+- **ファイル**: `cup_handle_detector_v2.py`, `cup_handle_v2_demo.py`
+
+### V1（短期パターン版）
+- **対象**: 数週間〜1年程度の短期パターン
+- **タイムフレーム**: 日足
+- **対象銘柄**: 個別株
+- **ファイル**: `cup_handle_detector.py`, `cup_handle_demo.py`
+
 ## 概要
 
 カップウィズハンドルパターンは、テクニカル分析における強気の継続パターンで、以下の特徴を持ちます：
@@ -62,14 +76,63 @@ pip install -r requirements.txt
 
 ## 使用方法
 
-### 基本的な使い方
+### V2版（長期パターン検出） - 推奨
 
 ```bash
-# メインスクリプトを実行（デフォルトで50銘柄をスクリーニング）
+# デモ版を実行（SLV風のパターンをシミュレーション）
+python cup_handle_v2_demo.py
+
+# 実際のETFデータで分析（yfinanceが必要）
+python cup_handle_detector_v2.py
+```
+
+### Python スクリプトとして使用（V2）
+
+```python
+from cup_handle_detector_v2 import CupHandleDetectorV2
+
+# 検出器を初期化（長期パターン用のパラメータ）
+detector = CupHandleDetectorV2(
+    cup_depth_min=0.15,        # カップ深さ 15-70%
+    cup_depth_max=0.70,
+    cup_quarters_min=8,        # カップ期間 2-20年
+    cup_quarters_max=80,
+    handle_quarters_min=2,     # ハンドル期間 0.5-4年
+    handle_quarters_max=16
+)
+
+# 単一ETFを分析（全期間データを取得）
+result = detector.detect_pattern('SLV', period='max')
+
+if result['pattern_found']:
+    print(f"パターン検出! スコア: {result['score']:.1f}")
+    # チャートを保存
+    detector.visualize_pattern(result, save_path='slv_pattern.png')
+else:
+    print(f"パターンなし: {result['message']}")
+
+# 複数ETFをスクリーニング
+etfs = ['SLV', 'GLD', 'SPY', 'QQQ', 'TLT', 'IEF']
+results = detector.screen_etfs(etfs, period='max', min_score=30)
+
+# 結果を表示
+for r in results:
+    cup = r['cup']
+    print(f"{r['ticker']}: スコア {r['score']:.1f} "
+          f"(カップ: {cup['cup_duration_years']:.1f}年, {cup['cup_depth']*100:.0f}%)")
+```
+
+### V1版（短期パターン検出）
+
+```bash
+# デモ版を実行
+python cup_handle_demo.py
+
+# 実際の株価データで分析
 python cup_handle_detector.py
 ```
 
-### Python スクリプトとして使用
+### Python スクリプトとして使用（V1）
 
 ```python
 from cup_handle_detector import CupHandleDetector
@@ -82,18 +145,11 @@ result = detector.detect_pattern('AAPL', period='2y')
 
 if result['pattern_found']:
     print(f"パターン検出! スコア: {result['score']:.1f}")
-    # チャートを保存
     detector.visualize_pattern(result, save_path='aapl_pattern.png')
-else:
-    print(f"パターンなし: {result['message']}")
 
 # 複数銘柄をスクリーニング
 tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
 results = detector.screen_stocks(tickers, min_score=60)
-
-# 結果を表示
-for r in results:
-    print(f"{r['ticker']}: スコア {r['score']:.1f}")
 ```
 
 ### パラメータのカスタマイズ
