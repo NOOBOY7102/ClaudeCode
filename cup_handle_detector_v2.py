@@ -646,7 +646,7 @@ def main():
         print("=" * 100)
 
         for i, result in enumerate(results[:10], 1):
-            save_path = f"/home/user/ClaudeCode/cup_handle_v2_{result['ticker']}.png"
+            save_path = f"cup_handle_v2_{result['ticker']}.png"
             detector.visualize_pattern(result, save_path=save_path)
 
         # サマリーレポート
