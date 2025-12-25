@@ -96,14 +96,14 @@ python cup_handle_detector_v2.py
 ```python
 from cup_handle_detector_v2 import CupHandleDetectorV2
 
-# 検出器を初期化（長期パターン用のパラメータ）
+# 検出器を初期化（超長期パターン用のパラメータ）
 detector = CupHandleDetectorV2(
-    cup_depth_min=0.15,        # カップ深さ 15-70%
-    cup_depth_max=0.70,
-    cup_quarters_min=8,        # カップ期間 2-20年
-    cup_quarters_max=80,
-    handle_quarters_min=2,     # ハンドル期間 0.5-4年
-    handle_quarters_max=16
+    cup_depth_min=0.20,        # カップ深さ 20-85%（より明確なパターン）
+    cup_depth_max=0.85,
+    cup_quarters_min=12,       # カップ期間 3-40年（超長期対応）
+    cup_quarters_max=160,
+    handle_quarters_min=2,     # ハンドル期間 0.5-6年
+    handle_quarters_max=24
 )
 
 # 単一ETFを分析（全期間データを取得）

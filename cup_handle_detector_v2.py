@@ -22,14 +22,14 @@ class CupHandleDetectorV2:
     """大規模カップウィズハンドルパターン検出器（3ヶ月足対応）"""
 
     def __init__(self,
-                 cup_depth_min=0.15,        # カップの最小深さ (15%)
-                 cup_depth_max=0.70,        # カップの最大深さ (70%)
+                 cup_depth_min=0.20,        # カップの最小深さ (20%) - より深いパターンに焦点
+                 cup_depth_max=0.85,        # カップの最大深さ (85%)
                  handle_depth_min=0.05,     # ハンドルの最小深さ (5%)
-                 handle_depth_max=0.25,     # ハンドルの最大深さ (25%)
-                 cup_quarters_min=8,        # カップの最小期間 (四半期: 8四半期=2年)
-                 cup_quarters_max=80,       # カップの最大期間 (四半期: 80四半期=20年)
-                 handle_quarters_min=2,     # ハンドルの最小期間 (四半期: 2四半期=6ヶ月)
-                 handle_quarters_max=16,    # ハンドルの最大期間 (四半期: 16四半期=4年)
+                 handle_depth_max=0.30,     # ハンドルの最大深さ (30%)
+                 cup_quarters_min=12,       # カップの最小期間 (12四半期=3年)
+                 cup_quarters_max=160,      # カップの最大期間 (160四半期=40年) - 超長期対応
+                 handle_quarters_min=2,     # ハンドルの最小期間 (2四半期=0.5年)
+                 handle_quarters_max=24,    # ハンドルの最大期間 (24四半期=6年)
                  timeframe='quarterly'):    # タイムフレーム
         """
         パラメータ:
@@ -155,9 +155,9 @@ class CupHandleDetectorV2:
                 for right_high_idx in right_high_candidates:
                     right_high_price = prices[right_high_idx]
 
-                    # 右端の高さをチェック（左端の85%以上）
-                    # 大規模パターンでは完全に戻らないこともある
-                    if right_high_price < left_high_price * 0.85:
+                    # 右端の高さをチェック（左端の80%以上）
+                    # 超長期パターンでは完全に戻らないこともある
+                    if right_high_price < left_high_price * 0.80:
                         continue
 
                     # カップの期間をチェック（四半期数）
@@ -171,7 +171,9 @@ class CupHandleDetectorV2:
                     if left_duration == 0 or right_duration == 0:
                         continue
                     symmetry_ratio = min(left_duration, right_duration) / max(left_duration, right_duration)
-                    if symmetry_ratio < 0.2:  # 大規模パターンでは緩めの基準
+                    # 超長期パターン（10年以上）では対称性要件をさらに緩和
+                    min_symmetry = 0.15 if cup_duration >= 40 else 0.20
+                    if symmetry_ratio < min_symmetry:
                         continue
 
                     cups.append({
@@ -312,33 +314,43 @@ class CupHandleDetectorV2:
     def calculate_pattern_score(self, cup, handle):
         """
         パターンの品質スコアを計算（0-100）
+        超長期パターンに高スコアを与える
         """
         score = 0
 
-        # カップの深さ（20-40%が理想）
-        ideal_cup_depth = 0.30
+        # カップの深さ（25-50%が理想、深いほど良い）
+        ideal_cup_depth = 0.35
         cup_depth_diff = abs(cup['cup_depth'] - ideal_cup_depth)
         cup_depth_score = max(0, 100 * (1 - cup_depth_diff / ideal_cup_depth))
-        score += cup_depth_score * 0.25
+        # 深さが30%以上ならボーナス
+        if cup['cup_depth'] >= 0.30:
+            cup_depth_score = min(100, cup_depth_score * 1.1)
+        score += cup_depth_score * 0.30
 
-        # カップの対称性
+        # カップの対称性（超長期では重要度を下げる）
         symmetry_score = cup['symmetry_ratio'] * 100
-        score += symmetry_score * 0.20
+        score += symmetry_score * 0.10
 
-        # ハンドルの深さ（10-15%が理想）
-        ideal_handle_depth = 0.12
+        # ハンドルの深さ（8-15%が理想）
+        ideal_handle_depth = 0.11
         handle_depth_diff = abs(handle['handle_depth'] - ideal_handle_depth)
         handle_depth_score = max(0, 100 * (1 - handle_depth_diff / ideal_handle_depth))
-        score += handle_depth_score * 0.25
+        score += handle_depth_score * 0.20
 
-        # カップの期間（適度な長さ: 3-10年が理想）
-        ideal_cup_years = 6
-        cup_years_diff = abs(cup['cup_duration_years'] - ideal_cup_years)
-        cup_duration_score = max(0, 100 * (1 - cup_years_diff / ideal_cup_years))
-        score += cup_duration_score * 0.15
+        # カップの期間（長期ほど高評価: 5-15年が理想、それ以上も許容）
+        cup_years = cup['cup_duration_years']
+        if cup_years >= 5 and cup_years <= 15:
+            cup_duration_score = 100
+        elif cup_years > 15:
+            # 15年以上でも高スコア（超長期パターン）
+            cup_duration_score = max(70, 100 - (cup_years - 15) * 2)
+        else:
+            # 5年未満はペナルティ
+            cup_duration_score = cup_years / 5 * 100
+        score += cup_duration_score * 0.25
 
-        # ハンドルの期間（1-2年が理想）
-        ideal_handle_years = 1.5
+        # ハンドルの期間（1-3年が理想）
+        ideal_handle_years = 2.0
         handle_years_diff = abs(handle['handle_duration_years'] - ideal_handle_years)
         handle_duration_score = max(0, 100 * (1 - handle_years_diff / ideal_handle_years))
         score += handle_duration_score * 0.15
@@ -346,24 +358,30 @@ class CupHandleDetectorV2:
         return max(0, min(100, score))
 
     def calculate_cup_only_score(self, cup):
-        """カップのみの場合のスコア"""
+        """カップのみの場合のスコア（ハンドル未形成）"""
         score = 0
 
-        # カップの深さ
-        ideal_cup_depth = 0.30
+        # カップの深さ（深いほど良い）
+        ideal_cup_depth = 0.35
         cup_depth_diff = abs(cup['cup_depth'] - ideal_cup_depth)
         cup_depth_score = max(0, 100 * (1 - cup_depth_diff / ideal_cup_depth))
-        score += cup_depth_score * 0.4
+        if cup['cup_depth'] >= 0.30:
+            cup_depth_score = min(100, cup_depth_score * 1.1)
+        score += cup_depth_score * 0.40
 
         # カップの対称性
         symmetry_score = cup['symmetry_ratio'] * 100
-        score += symmetry_score * 0.3
+        score += symmetry_score * 0.20
 
-        # カップの期間
-        ideal_cup_years = 6
-        cup_years_diff = abs(cup['cup_duration_years'] - ideal_cup_years)
-        cup_duration_score = max(0, 100 * (1 - cup_years_diff / ideal_cup_years))
-        score += cup_duration_score * 0.3
+        # カップの期間（長期ほど高評価）
+        cup_years = cup['cup_duration_years']
+        if cup_years >= 5 and cup_years <= 15:
+            cup_duration_score = 100
+        elif cup_years > 15:
+            cup_duration_score = max(70, 100 - (cup_years - 15) * 2)
+        else:
+            cup_duration_score = cup_years / 5 * 100
+        score += cup_duration_score * 0.40
 
         return max(0, min(100, score))
 
@@ -566,16 +584,16 @@ class CupHandleDetectorV2:
 def main():
     """メイン関数"""
 
-    # 検出器を初期化（長期パターン用のパラメータ）
+    # 検出器を初期化（超長期パターン用のパラメータ）
     detector = CupHandleDetectorV2(
-        cup_depth_min=0.15,           # 15%以上
-        cup_depth_max=0.70,           # 70%以下
+        cup_depth_min=0.20,           # 20%以上（より明確なパターン）
+        cup_depth_max=0.85,           # 85%以下
         handle_depth_min=0.05,        # 5%以上
-        handle_depth_max=0.25,        # 25%以下
-        cup_quarters_min=8,           # 最小2年
-        cup_quarters_max=80,          # 最大20年
+        handle_depth_max=0.30,        # 30%以下
+        cup_quarters_min=12,          # 最小3年
+        cup_quarters_max=160,         # 最大40年（1980-2020のような超長期対応）
         handle_quarters_min=2,        # 最小0.5年
-        handle_quarters_max=16        # 最大4年
+        handle_quarters_max=24        # 最大6年
     )
 
     # スクリーニング対象のETF
@@ -614,8 +632,8 @@ def main():
         'XLI',   # Industrials
     ]
 
-    # スクリーニング実行
-    results = detector.screen_etfs(etfs, period='max', min_score=30)
+    # スクリーニング実行（スコア閾値を上げて、より質の高いパターンのみ抽出）
+    results = detector.screen_etfs(etfs, period='max', min_score=50)
 
     # 結果を表示
     if results:
