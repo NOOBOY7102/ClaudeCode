@@ -8,13 +8,13 @@
 - **対象**: 数年〜数十年レベルの大規模パターン
 - **タイムフレーム**: 3ヶ月足（四半期足）
 - **対象銘柄**: インデックス、コモディティ、債券ETF（SLV, GLD, SPY, QQQ, TLT など）
-- **ファイル**: `cup_handle_detector_v2.py`, `cup_handle_v2_demo.py`
+- **ファイル**: `cup_handle_detector_v2.py`
 
 ### V1（短期パターン版）
 - **対象**: 数週間〜1年程度の短期パターン
 - **タイムフレーム**: 日足
 - **対象銘柄**: 個別株
-- **ファイル**: `cup_handle_detector.py`, `cup_handle_demo.py`
+- **ファイル**: `cup_handle_detector.py`
 
 ## 概要
 
@@ -79,12 +79,17 @@ pip install -r requirements.txt
 ### V2版（長期パターン検出） - 推奨
 
 ```bash
-# デモ版を実行（SLV風のパターンをシミュレーション）
-python cup_handle_v2_demo.py
-
-# 実際のETFデータで分析（yfinanceが必要）
+# 実際のETFデータで分析
 python cup_handle_detector_v2.py
 ```
+
+このスクリプトは、以下のETFを自動的にスクリーニングします：
+- **株式インデックス**: SPY, QQQ, DIA, IWM, VTI, EEM, EFA, VEA
+- **コモディティ**: GLD, SLV, USO, DBC, PDBC
+- **債券**: TLT, IEF, SHY, AGG, LQD, HYG, TIP
+- **セクター**: XLF, XLE, XLK, XLV, XLI
+
+上位10個のETFチャートが自動的に生成されます。
 
 ### Python スクリプトとして使用（V2）
 
@@ -125,9 +130,6 @@ for r in results:
 ### V1版（短期パターン検出）
 
 ```bash
-# デモ版を実行
-python cup_handle_demo.py
-
 # 実際の株価データで分析
 python cup_handle_detector.py
 ```
