@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import auth, detect, points, users
+from app.api.v1 import auth, detect, points, sessions, upload, users
 from app.core.config import settings
 
 # Configure logging
@@ -69,6 +69,8 @@ app.include_router(auth.router, prefix="/api/v1")
 app.include_router(points.router, prefix="/api/v1")
 app.include_router(detect.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
+app.include_router(sessions.router, prefix="/api/v1")
+app.include_router(upload.router, prefix="/api/v1")
 
 
 @app.get("/")

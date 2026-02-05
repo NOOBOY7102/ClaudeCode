@@ -1,0 +1,68 @@
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist/
+build/
+*.egg
+*.whl
+.cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+
+# ML
+ml/datasets/
+ml/runs/
+*.pt
+*.onnx
+*.pth
+
+# Docker
+.docker/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# PID files
+.backend.pid
+.frontend.pid
+
+# Uploaded files
+uploads/
+
+# MinIO data
+minio_data/

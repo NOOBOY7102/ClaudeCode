@@ -1,0 +1,17 @@
+# ML Training Dependencies
+ultralytics>=8.1.0
+torch>=2.1.0
+torchvision>=0.16.0
+onnx>=1.15.0
+onnxruntime>=1.16.0
+
+# Data processing
+opencv-python>=4.9.0
+pillow>=10.2.0
+numpy>=1.24.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.66.0
+matplotlib>=3.7.0
+seaborn>=0.13.0

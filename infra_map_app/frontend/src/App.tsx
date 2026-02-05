@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
+import { ToastContainer } from './components/UI';
 import Layout from './components/Layout';
 import MapPage from './pages/MapPage';
 import CameraPage from './pages/CameraPage';
@@ -20,6 +21,7 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
 function App() {
   return (
     <BrowserRouter>
+      <ToastContainer />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
