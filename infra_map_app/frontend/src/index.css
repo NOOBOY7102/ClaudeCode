@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Leaflet map container styles */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  z-index: 0;
+}
+
+/* Custom marker styles */
+.tactile-marker {
+  @apply flex items-center justify-center;
+}
+
+.tactile-marker-warning {
+  @apply bg-tactile-warning rounded-full border-2 border-white shadow-lg;
+}
+
+.tactile-marker-guiding {
+  @apply bg-tactile-guiding rounded-full border-2 border-white shadow-lg;
+}
+
+/* Camera overlay */
+.camera-overlay {
+  @apply fixed inset-0 bg-black z-50;
+}
+
+/* Bottom navigation */
+.bottom-nav {
+  @apply fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 pb-safe;
+}
+
+/* Safe area padding */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0);
+}
+
+/* Loading spinner */
+.spinner {
+  @apply animate-spin rounded-full border-4 border-gray-200 border-t-primary-500;
+}
+
+/* Toast notifications */
+.toast {
+  @apply fixed top-4 left-4 right-4 bg-white rounded-lg shadow-lg p-4 z-50 transform transition-transform;
+}
+
+.toast-enter {
+  @apply translate-y-[-100%] opacity-0;
+}
+
+.toast-enter-active {
+  @apply translate-y-0 opacity-100;
+}
+
+.toast-exit {
+  @apply translate-y-0 opacity-100;
+}
+
+.toast-exit-active {
+  @apply translate-y-[-100%] opacity-0;
+}

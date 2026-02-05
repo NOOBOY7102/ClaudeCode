@@ -1,0 +1,41 @@
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Database
+sqlalchemy>=2.0.25
+asyncpg>=0.29.0
+alembic>=1.13.1
+geoalchemy2>=0.14.3
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# Validation
+pydantic>=2.5.3
+pydantic-settings>=2.1.0
+email-validator>=2.1.0
+
+# AI/ML
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.1.0
+opencv-python>=4.9.0
+pillow>=10.2.0
+onnxruntime>=1.16.0
+
+# Storage
+boto3>=1.34.0
+python-magic>=0.4.27
+
+# Caching
+redis>=5.0.1
+
+# Task queue
+celery>=5.3.6
+
+# Utilities
+httpx>=0.26.0
+python-dotenv>=1.0.0
