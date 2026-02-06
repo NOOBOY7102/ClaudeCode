@@ -9,9 +9,12 @@ import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
+  // 開発モード: 認証をスキップ
+  const SKIP_AUTH = true;
+
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
 
-  if (!isAuthenticated) {
+  if (!SKIP_AUTH && !isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
 
