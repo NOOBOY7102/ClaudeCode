@@ -2,9 +2,12 @@ import * as THREE from 'three';
 import { DexelModel } from './DexelModel';
 
 /**
- * Converts a DexelModel into a Three.js mesh for rendering.
- * Uses a heightmap approach: for each grid cell, generates top/bottom faces
- * and side faces where heights differ from neighbors.
+ * Converts a DexelModel into a smooth heightmap-based Three.js mesh.
+ *
+ * Instead of flat quads per cell, we create a terrain mesh where each
+ * Dexel cell center becomes a vertex, and triangles connect neighboring
+ * vertices. Normals are computed from central differences of the height
+ * field, producing smooth shading that reveals tool marks (scallops).
  */
 export function dexelToMesh(
   model: DexelModel,
@@ -12,14 +15,12 @@ export function dexelToMesh(
   targetModel?: DexelModel
 ): THREE.BufferGeometry {
   const { nx, ny, originX, originY, cellSize, segments } = model.grid;
-  const positions: number[] = [];
-  const normals: number[] = [];
-  const colors: number[] = [];
 
-  // Precompute top heights for neighbor checks
+  // --- Build height arrays ---
   const topZ = new Float32Array(nx * ny);
   const botZ = new Float32Array(nx * ny);
   const hasMat = new Uint8Array(nx * ny);
+  let globalMinZ = 1e9, globalMaxZ = -1e9;
 
   for (let i = 0; i < nx * ny; i++) {
     const seg = segments[i];
@@ -27,113 +28,216 @@ export function dexelToMesh(
       hasMat[i] = 1;
       topZ[i] = seg[seg.length - 1];
       botZ[i] = seg[0];
+      if (topZ[i] > globalMaxZ) globalMaxZ = topZ[i];
+      if (botZ[i] < globalMinZ) globalMinZ = botZ[i];
     }
   }
 
-  // Color helper
-  function getColor(ix: number, iy: number): [number, number, number] {
-    if (colorMode === 'heightmap') {
-      const z = topZ[iy * nx + ix];
-      const minZ = model.bbox.minZ;
-      const maxZ = model.bbox.maxZ;
-      const t = (z - minZ) / (maxZ - minZ + 0.001);
-      return heatmapColor(t);
-    } else if (colorMode === 'difference' && targetModel) {
+  // --- Compute smooth normals via central differences ---
+  const normX = new Float32Array(nx * ny);
+  const normY = new Float32Array(nx * ny);
+  const normZ = new Float32Array(nx * ny);
+
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
       const idx = iy * nx + ix;
-      const currentTop = topZ[idx];
-      const targetSeg = targetModel.grid.segments[idx];
-      if (!targetSeg || targetSeg.length < 2) {
-        // No target = excess material
-        return [1.0, 0.3, 0.3]; // red
-      }
-      const targetTop = targetSeg[targetSeg.length - 1];
-      const diff = currentTop - targetTop;
-      if (diff > 0.05) {
-        // Excess material (not yet cut enough)
-        const t = Math.min(1, diff / 2.0);
-        return [0.5 + 0.5 * t, 0.5 - 0.3 * t, 0.2]; // orange-red
-      } else if (diff < -0.05) {
-        // Over-cut (gouge)
-        const t = Math.min(1, -diff / 2.0);
-        return [0.2, 0.3, 0.5 + 0.5 * t]; // blue
-      } else {
-        return [0.3, 0.85, 0.4]; // green = within tolerance
-      }
+      if (!hasMat[idx]) { normZ[idx] = 1; continue; }
+
+      // Central differences for dz/dx and dz/dy
+      const zL = (ix > 0 && hasMat[idx - 1]) ? topZ[idx - 1] : topZ[idx];
+      const zR = (ix < nx - 1 && hasMat[idx + 1]) ? topZ[idx + 1] : topZ[idx];
+      const zD = (iy > 0 && hasMat[idx - nx]) ? topZ[idx - nx] : topZ[idx];
+      const zU = (iy < ny - 1 && hasMat[idx + nx]) ? topZ[idx + nx] : topZ[idx];
+
+      const dzdx = (zR - zL) / (2 * cellSize);
+      const dzdy = (zU - zD) / (2 * cellSize);
+
+      // Normal = normalize(-dzdx, -dzdy, 1)
+      const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
+      normX[idx] = -dzdx / len;
+      normY[idx] = -dzdy / len;
+      normZ[idx] = 1 / len;
     }
-    // solid
-    return [0.7, 0.75, 0.8]; // metallic gray
   }
+
+  // --- Color computation ---
+  const colR = new Float32Array(nx * ny);
+  const colG = new Float32Array(nx * ny);
+  const colB = new Float32Array(nx * ny);
 
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
       const idx = iy * nx + ix;
       if (!hasMat[idx]) continue;
 
-      const x0 = originX + ix * cellSize;
-      const x1 = x0 + cellSize;
-      const y0 = originY + iy * cellSize;
-      const y1 = y0 + cellSize;
+      let cr: number, cg: number, cb: number;
+
+      if (colorMode === 'heightmap') {
+        const range = globalMaxZ - globalMinZ + 0.001;
+        const t = (topZ[idx] - globalMinZ) / range;
+        [cr, cg, cb] = heatmapColor(t);
+      } else if (colorMode === 'difference' && targetModel) {
+        const tSeg = targetModel.grid.segments[idx];
+        if (!tSeg || tSeg.length < 2) {
+          [cr, cg, cb] = [1.0, 0.3, 0.3];
+        } else {
+          const diff = topZ[idx] - tSeg[tSeg.length - 1];
+          if (diff > 0.05) {
+            const t = Math.min(1, diff / 2.0);
+            [cr, cg, cb] = [0.5 + 0.5 * t, 0.5 - 0.3 * t, 0.2];
+          } else if (diff < -0.05) {
+            const t = Math.min(1, -diff / 2.0);
+            [cr, cg, cb] = [0.2, 0.3, 0.5 + 0.5 * t];
+          } else {
+            [cr, cg, cb] = [0.3, 0.85, 0.4];
+          }
+        }
+      } else {
+        // Solid: subtle variation from height to show curvature
+        const base = 0.68;
+        const range = globalMaxZ - globalMinZ + 0.001;
+        const heightBias = ((topZ[idx] - globalMinZ) / range) * 0.12;
+        cr = base + heightBias;
+        cg = base + 0.03 + heightBias;
+        cb = base + 0.08 + heightBias;
+      }
+
+      colR[idx] = cr;
+      colG[idx] = cg;
+      colB[idx] = cb;
+    }
+  }
+
+  // --- Generate top surface mesh (smooth heightmap) ---
+  // Each cell with material gets 2 triangles connecting to its +X, +Y, +X+Y neighbors.
+  // Vertex positions are at cell centers with Z = topZ.
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const colors: number[] = [];
+
+  for (let iy = 0; iy < ny - 1; iy++) {
+    for (let ix = 0; ix < nx - 1; ix++) {
+      const i00 = iy * nx + ix;
+      const i10 = i00 + 1;
+      const i01 = i00 + nx;
+      const i11 = i00 + nx + 1;
+
+      // Need at least 3 of 4 corners to have material for a triangle
+      const m00 = hasMat[i00], m10 = hasMat[i10], m01 = hasMat[i01], m11 = hasMat[i11];
+      const msum = m00 + m10 + m01 + m11;
+      if (msum < 3) continue;
+
+      const x0 = originX + (ix + 0.5) * cellSize;
+      const x1 = originX + (ix + 1.5) * cellSize;
+      const y0 = originY + (iy + 0.5) * cellSize;
+      const y1 = originY + (iy + 1.5) * cellSize;
+
+      // Triangle 1: (0,0) -> (1,0) -> (0,1)
+      if (m00 && m10 && m01) {
+        pushVertex(positions, normals, colors, x0, y0, topZ[i00], normX[i00], normY[i00], normZ[i00], colR[i00], colG[i00], colB[i00]);
+        pushVertex(positions, normals, colors, x1, y0, topZ[i10], normX[i10], normY[i10], normZ[i10], colR[i10], colG[i10], colB[i10]);
+        pushVertex(positions, normals, colors, x0, y1, topZ[i01], normX[i01], normY[i01], normZ[i01], colR[i01], colG[i01], colB[i01]);
+      }
+
+      // Triangle 2: (1,0) -> (1,1) -> (0,1)
+      if (m10 && m11 && m01) {
+        pushVertex(positions, normals, colors, x1, y0, topZ[i10], normX[i10], normY[i10], normZ[i10], colR[i10], colG[i10], colB[i10]);
+        pushVertex(positions, normals, colors, x1, y1, topZ[i11], normX[i11], normY[i11], normZ[i11], colR[i11], colG[i11], colB[i11]);
+        pushVertex(positions, normals, colors, x0, y1, topZ[i01], normX[i01], normY[i01], normZ[i01], colR[i01], colG[i01], colB[i01]);
+      }
+    }
+  }
+
+  // --- Bottom surface (flat) ---
+  for (let iy = 0; iy < ny - 1; iy++) {
+    for (let ix = 0; ix < nx - 1; ix++) {
+      const i00 = iy * nx + ix;
+      const i10 = i00 + 1;
+      const i01 = i00 + nx;
+      const i11 = i00 + nx + 1;
+
+      const m00 = hasMat[i00], m10 = hasMat[i10], m01 = hasMat[i01], m11 = hasMat[i11];
+      if (m00 + m10 + m01 + m11 < 3) continue;
+
+      const x0 = originX + (ix + 0.5) * cellSize;
+      const x1 = originX + (ix + 1.5) * cellSize;
+      const y0 = originY + (iy + 0.5) * cellSize;
+      const y1 = originY + (iy + 1.5) * cellSize;
+
+      const dk = 0.5; // darken bottom
+
+      if (m00 && m10 && m01) {
+        pushVertex(positions, normals, colors, x0, y1, botZ[i01], 0, 0, -1, colR[i01] * dk, colG[i01] * dk, colB[i01] * dk);
+        pushVertex(positions, normals, colors, x1, y0, botZ[i10], 0, 0, -1, colR[i10] * dk, colG[i10] * dk, colB[i10] * dk);
+        pushVertex(positions, normals, colors, x0, y0, botZ[i00], 0, 0, -1, colR[i00] * dk, colG[i00] * dk, colB[i00] * dk);
+      }
+      if (m10 && m11 && m01) {
+        pushVertex(positions, normals, colors, x0, y1, botZ[i01], 0, 0, -1, colR[i01] * dk, colG[i01] * dk, colB[i01] * dk);
+        pushVertex(positions, normals, colors, x1, y1, botZ[i11], 0, 0, -1, colR[i11] * dk, colG[i11] * dk, colB[i11] * dk);
+        pushVertex(positions, normals, colors, x1, y0, botZ[i10], 0, 0, -1, colR[i10] * dk, colG[i10] * dk, colB[i10] * dk);
+      }
+    }
+  }
+
+  // --- Side walls at material boundaries ---
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const idx = iy * nx + ix;
+      if (!hasMat[idx]) continue;
+
+      const cx = originX + (ix + 0.5) * cellSize;
+      const cy = originY + (iy + 0.5) * cellSize;
       const zt = topZ[idx];
       const zb = botZ[idx];
+      const halfCell = cellSize * 0.5;
+      const [cr, cg, cb] = [colR[idx] * 0.75, colG[idx] * 0.75, colB[idx] * 0.75];
 
-      const [cr, cg, cb] = getColor(ix, iy);
-
-      // Top face (2 triangles)
-      pushQuad(positions, normals, colors,
-        x0, y0, zt, x1, y0, zt, x1, y1, zt, x0, y1, zt,
-        0, 0, 1, cr, cg, cb);
-
-      // Bottom face
-      pushQuad(positions, normals, colors,
-        x0, y1, zb, x1, y1, zb, x1, y0, zb, x0, y0, zb,
-        0, 0, -1, cr * 0.6, cg * 0.6, cb * 0.6);
-
-      // Side faces - only where neighbor is different or missing
-      // +X side
-      if (ix === nx - 1 || !hasMat[idx + 1] || topZ[idx + 1] < zt - 0.001) {
-        const nzt = (ix < nx - 1 && hasMat[idx + 1]) ? topZ[idx + 1] : zb;
-        const sideTop = zt;
-        const sideBot = Math.max(zb, nzt);
-        if (sideTop > sideBot) {
-          pushQuad(positions, normals, colors,
-            x1, y0, sideBot, x1, y1, sideBot, x1, y1, sideTop, x1, y0, sideTop,
-            1, 0, 0, cr * 0.85, cg * 0.85, cb * 0.85);
-        }
+      // -X boundary
+      if (ix === 0 || !hasMat[idx - 1]) {
+        const wx = cx - halfCell;
+        pushWallQuad(positions, normals, colors, wx, cy - halfCell, wx, cy + halfCell, zb, zt, -1, 0, 0, cr, cg, cb);
+      }
+      // +X boundary
+      if (ix === nx - 1 || !hasMat[idx + 1]) {
+        const wx = cx + halfCell;
+        pushWallQuad(positions, normals, colors, wx, cy + halfCell, wx, cy - halfCell, zb, zt, 1, 0, 0, cr, cg, cb);
+      }
+      // -Y boundary
+      if (iy === 0 || !hasMat[idx - nx]) {
+        const wy = cy - halfCell;
+        pushWallQuad(positions, normals, colors, cx + halfCell, wy, cx - halfCell, wy, zb, zt, 0, -1, 0, cr, cg, cb);
+      }
+      // +Y boundary
+      if (iy === ny - 1 || !hasMat[idx + nx]) {
+        const wy = cy + halfCell;
+        pushWallQuad(positions, normals, colors, cx - halfCell, wy, cx + halfCell, wy, zb, zt, 0, 1, 0, cr, cg, cb);
       }
 
-      // -X side
-      if (ix === 0 || !hasMat[idx - 1] || topZ[idx - 1] < zt - 0.001) {
-        const nzt = (ix > 0 && hasMat[idx - 1]) ? topZ[idx - 1] : zb;
-        const sideTop = zt;
-        const sideBot = Math.max(zb, nzt);
-        if (sideTop > sideBot) {
-          pushQuad(positions, normals, colors,
-            x0, y1, sideBot, x0, y0, sideBot, x0, y0, sideTop, x0, y1, sideTop,
-            -1, 0, 0, cr * 0.85, cg * 0.85, cb * 0.85);
+      // Internal step walls: where neighbor exists but has significantly different top Z
+      // +X step
+      if (ix < nx - 1 && hasMat[idx + 1]) {
+        const nz = topZ[idx + 1];
+        if (Math.abs(zt - nz) > cellSize * 0.3) {
+          const wx = cx + halfCell;
+          const lo = Math.min(zt, nz);
+          const hi = Math.max(zt, nz);
+          const fnx = zt > nz ? 1 : -1;
+          pushWallQuad(positions, normals, colors,
+            wx, cy - halfCell, wx, cy + halfCell,
+            lo, hi, fnx, 0, 0, cr, cg, cb);
         }
       }
-
-      // +Y side
-      if (iy === ny - 1 || !hasMat[idx + nx] || topZ[idx + nx] < zt - 0.001) {
-        const nzt = (iy < ny - 1 && hasMat[idx + nx]) ? topZ[idx + nx] : zb;
-        const sideTop = zt;
-        const sideBot = Math.max(zb, nzt);
-        if (sideTop > sideBot) {
-          pushQuad(positions, normals, colors,
-            x1, y1, sideBot, x0, y1, sideBot, x0, y1, sideTop, x1, y1, sideTop,
-            0, 1, 0, cr * 0.9, cg * 0.9, cb * 0.9);
-        }
-      }
-
-      // -Y side
-      if (iy === 0 || !hasMat[idx - nx] || topZ[idx - nx] < zt - 0.001) {
-        const nzt = (iy > 0 && hasMat[idx - nx]) ? topZ[idx - nx] : zb;
-        const sideTop = zt;
-        const sideBot = Math.max(zb, nzt);
-        if (sideTop > sideBot) {
-          pushQuad(positions, normals, colors,
-            x0, y0, sideBot, x1, y0, sideBot, x1, y0, sideTop, x0, y0, sideTop,
-            0, -1, 0, cr * 0.9, cg * 0.9, cb * 0.9);
+      // +Y step
+      if (iy < ny - 1 && hasMat[idx + nx]) {
+        const nz = topZ[idx + nx];
+        if (Math.abs(zt - nz) > cellSize * 0.3) {
+          const wy = cy + halfCell;
+          const lo = Math.min(zt, nz);
+          const hi = Math.max(zt, nz);
+          const fny = zt > nz ? 1 : -1;
+          pushWallQuad(positions, normals, colors,
+            cx - halfCell, wy, cx + halfCell, wy,
+            lo, hi, 0, fny, 0, cr, cg, cb);
         }
       }
     }
@@ -147,28 +251,37 @@ export function dexelToMesh(
   return geometry;
 }
 
-function pushQuad(
+// --- Helpers ---
+
+function pushVertex(
   positions: number[], normals: number[], colors: number[],
-  x0: number, y0: number, z0: number,
-  x1: number, y1: number, z1: number,
-  x2: number, y2: number, z2: number,
-  x3: number, y3: number, z3: number,
+  x: number, y: number, z: number,
   nx: number, ny: number, nz: number,
   cr: number, cg: number, cb: number
 ) {
-  // Triangle 1: v0, v1, v2
-  positions.push(x0, y0, z0, x1, y1, z1, x2, y2, z2);
-  // Triangle 2: v0, v2, v3
-  positions.push(x0, y0, z0, x2, y2, z2, x3, y3, z3);
+  positions.push(x, y, z);
+  normals.push(nx, ny, nz);
+  colors.push(cr, cg, cb);
+}
 
-  for (let i = 0; i < 6; i++) {
-    normals.push(nx, ny, nz);
-    colors.push(cr, cg, cb);
-  }
+function pushWallQuad(
+  positions: number[], normals: number[], colors: number[],
+  x0: number, y0: number, x1: number, y1: number,
+  zBot: number, zTop: number,
+  nx: number, ny: number, nz: number,
+  cr: number, cg: number, cb: number
+) {
+  // Two triangles for a vertical quad
+  pushVertex(positions, normals, colors, x0, y0, zBot, nx, ny, nz, cr, cg, cb);
+  pushVertex(positions, normals, colors, x1, y1, zBot, nx, ny, nz, cr, cg, cb);
+  pushVertex(positions, normals, colors, x1, y1, zTop, nx, ny, nz, cr, cg, cb);
+
+  pushVertex(positions, normals, colors, x0, y0, zBot, nx, ny, nz, cr, cg, cb);
+  pushVertex(positions, normals, colors, x1, y1, zTop, nx, ny, nz, cr, cg, cb);
+  pushVertex(positions, normals, colors, x0, y0, zTop, nx, ny, nz, cr, cg, cb);
 }
 
 function heatmapColor(t: number): [number, number, number] {
-  // Blue -> Cyan -> Green -> Yellow -> Red
   t = Math.max(0, Math.min(1, t));
   if (t < 0.25) {
     const s = t / 0.25;
@@ -204,40 +317,34 @@ export function createToolMesh(
   });
 
   if (toolType === 'ball') {
-    // Hemisphere
     const sphere = new THREE.SphereGeometry(radius, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2);
     const sphereMesh = new THREE.Mesh(sphere, material);
     sphereMesh.position.set(0, 0, radius);
     group.add(sphereMesh);
 
-    // Cylinder (flute body above hemisphere)
     const cyl = new THREE.CylinderGeometry(radius, radius, fluteLength - radius, 24);
     const cylMesh = new THREE.Mesh(cyl, material);
     cylMesh.rotation.x = Math.PI / 2;
     cylMesh.position.set(0, 0, radius + (fluteLength - radius) / 2);
     group.add(cylMesh);
   } else if (toolType === 'bull_nose') {
-    // Flat bottom with rounded corners (torus + cylinder)
     const torusR = radius - cornerRadius;
     const torus = new THREE.TorusGeometry(torusR, cornerRadius, 12, 24, Math.PI * 2);
     const torusMesh = new THREE.Mesh(torus, material);
     torusMesh.position.set(0, 0, cornerRadius);
     group.add(torusMesh);
 
-    // Flat disk
     const disk = new THREE.CircleGeometry(torusR, 24);
     const diskMesh = new THREE.Mesh(disk, material);
     diskMesh.position.set(0, 0, 0);
     group.add(diskMesh);
 
-    // Cylinder
     const cyl = new THREE.CylinderGeometry(radius, radius, fluteLength - cornerRadius, 24);
     const cylMesh = new THREE.Mesh(cyl, material);
     cylMesh.rotation.x = Math.PI / 2;
     cylMesh.position.set(0, 0, cornerRadius + (fluteLength - cornerRadius) / 2);
     group.add(cylMesh);
   } else {
-    // Flat end mill
     const cyl = new THREE.CylinderGeometry(radius, radius, fluteLength, 24);
     const cylMesh = new THREE.Mesh(cyl, material);
     cylMesh.rotation.x = Math.PI / 2;
@@ -255,36 +362,25 @@ export function createToolpathLines(segments: { points: { x: number; y: number; 
   const group = new THREE.Group();
 
   for (const seg of segments) {
-    const rapidPoints: number[] = [];
-    const feedPoints: number[] = [];
+    const feedPositions: number[] = [];
+    let prevPoint: { x: number; y: number; z: number } | null = null;
 
     for (let i = 0; i < seg.points.length; i++) {
       const p = seg.points[i];
-      if (p.type === 'rapid') {
-        rapidPoints.push(p.x, p.y, p.z);
-      } else {
-        feedPoints.push(p.x, p.y, p.z);
+      if (p.type !== 'rapid' && prevPoint) {
+        feedPositions.push(prevPoint.x, prevPoint.y, prevPoint.z);
+        feedPositions.push(p.x, p.y, p.z);
       }
+      prevPoint = p;
     }
 
-    if (rapidPoints.length >= 6) {
+    if (feedPositions.length >= 6) {
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(rapidPoints, 3));
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(feedPositions, 3));
       const line = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
-        color: 0xff4444,
-        transparent: true,
-        opacity: 0.5,
-      }));
-      group.add(line);
-    }
-
-    if (feedPoints.length >= 6) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(feedPoints, 3));
-      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
         color: 0x4488ff,
         transparent: true,
-        opacity: 0.6,
+        opacity: 0.4,
       }));
       group.add(line);
     }
