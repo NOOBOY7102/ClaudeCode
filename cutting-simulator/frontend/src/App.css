@@ -1,0 +1,295 @@
+/* === Layout === */
+.app-container {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #0d0d1a;
+  color: #e0e0e0;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+.viewer-container {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+
+.panel-container {
+  width: 300px;
+  min-width: 300px;
+  height: 100vh;
+  overflow-y: auto;
+  background: #12122a;
+  border-left: 1px solid #2a2a4a;
+}
+
+/* === Control Panel === */
+.control-panel {
+  padding: 16px;
+}
+
+.control-panel h2 {
+  margin: 0 0 16px 0;
+  font-size: 18px;
+  color: #7788ff;
+  border-bottom: 2px solid #3344aa;
+  padding-bottom: 8px;
+}
+
+.section {
+  margin-bottom: 16px;
+  padding: 10px;
+  background: #1a1a35;
+  border-radius: 8px;
+  border: 1px solid #2a2a4a;
+}
+
+.section h3 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: #8899cc;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* === Buttons === */
+.button-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  padding: 8px 14px;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: white;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: #3366ff;
+}
+.btn-primary:hover:not(:disabled) {
+  background: #4477ff;
+}
+
+.btn-secondary {
+  background: #555577;
+}
+.btn-secondary:hover:not(:disabled) {
+  background: #6666aa;
+}
+
+.btn-warning {
+  background: #cc8800;
+}
+.btn-warning:hover {
+  background: #dd9922;
+}
+
+.btn-danger {
+  background: #884444;
+}
+.btn-danger:hover {
+  background: #aa5555;
+}
+
+/* === Progress Bar === */
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  background: #2a2a4a;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3366ff, #44cc88);
+  border-radius: 4px;
+  transition: width 0.1s;
+}
+
+.info-text {
+  font-size: 12px;
+  color: #8899aa;
+}
+
+.status-done {
+  color: #44cc88;
+  font-weight: 600;
+}
+
+.hint {
+  font-style: italic;
+  font-size: 11px;
+  color: #667788;
+}
+
+/* === Tool Info === */
+.tool-info {
+  font-size: 13px;
+}
+
+.tool-name {
+  font-weight: 600;
+  color: #dddd66;
+  margin-bottom: 2px;
+}
+
+.tool-detail {
+  font-size: 12px;
+  color: #99aabb;
+}
+
+/* === Tool List === */
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  background: #1e1e3a;
+}
+
+.tool-item.active {
+  background: #2a2a55;
+  border: 1px solid #4466aa;
+}
+
+.tool-id {
+  font-weight: 700;
+  color: #dddd66;
+  min-width: 24px;
+}
+
+.tool-label {
+  color: #bbccdd;
+}
+
+/* === Position Grid === */
+.position-grid {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 2px 8px;
+  font-size: 13px;
+  font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.axis-label {
+  font-weight: 700;
+}
+.axis-label.x { color: #ff4444; }
+.axis-label.y { color: #44cc44; }
+.axis-label.z { color: #4488ff; }
+
+.axis-value {
+  color: #ddddee;
+  text-align: right;
+}
+
+/* === Sliders === */
+.slider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.slider-row label {
+  font-size: 12px;
+  color: #99aabb;
+}
+
+.slider-row input[type="range"] {
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #2a2a4a;
+  border-radius: 3px;
+  outline: none;
+}
+
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #5577ff;
+  cursor: pointer;
+}
+
+/* === Radio & Checkbox === */
+.radio-group,
+.checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.radio-group label,
+.checkbox-group label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: #bbccdd;
+}
+
+.radio-group input,
+.checkbox-group input {
+  accent-color: #5577ff;
+}
+
+/* === File Input === */
+.file-input {
+  width: 100%;
+  font-size: 12px;
+  color: #99aabb;
+}
+
+.file-input::file-selector-button {
+  padding: 6px 12px;
+  border: 1px solid #4466aa;
+  border-radius: 4px;
+  background: #1e1e3a;
+  color: #bbccdd;
+  cursor: pointer;
+  margin-right: 8px;
+}
+
+.file-input::file-selector-button:hover {
+  background: #2a2a55;
+}
+
+/* === Scrollbar === */
+.panel-container::-webkit-scrollbar {
+  width: 6px;
+}
+.panel-container::-webkit-scrollbar-track {
+  background: #12122a;
+}
+.panel-container::-webkit-scrollbar-thumb {
+  background: #3a3a5a;
+  border-radius: 3px;
+}
