@@ -14,6 +14,7 @@ export function Viewer3D() {
   const toolGroupRef = useRef<THREE.Group | null>(null);
   const toolpathGroupRef = useRef<THREE.Group | null>(null);
   const animFrameRef = useRef<number>(0);
+  const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
 
   const {
     stockMesh: stockGeometry,
@@ -35,18 +36,42 @@ export function Viewer3D() {
     const width = container.clientWidth;
     const height = container.clientHeight;
 
-    // Renderer
+    // Renderer with tone mapping for PBR
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setClearColor(0x1a1a2e);
-    renderer.shadowMap.enabled = true;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.2;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
     // Scene
     const scene = new THREE.Scene();
     sceneRef.current = scene;
+
+    // Environment map for PBR reflections (procedural)
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    const envScene = new THREE.Scene();
+    envScene.background = new THREE.Color(0x444466);
+    // Add gradient lights to environment for visible reflections
+    const envLight1 = new THREE.Mesh(
+      new THREE.PlaneGeometry(200, 200),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
+    );
+    envLight1.position.set(0, 0, 80);
+    envScene.add(envLight1);
+    const envLight2 = new THREE.Mesh(
+      new THREE.PlaneGeometry(200, 200),
+      new THREE.MeshBasicMaterial({ color: 0x888899, side: THREE.DoubleSide })
+    );
+    envLight2.position.set(0, 80, 0);
+    envLight2.rotation.x = Math.PI / 2;
+    envScene.add(envLight2);
+
+    const envMap = pmremGenerator.fromScene(envScene, 0.04).texture;
+    scene.environment = envMap;
+    pmremGenerator.dispose();
 
     // Camera
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
@@ -62,28 +87,39 @@ export function Viewer3D() {
     controlsRef.current = controls;
 
     // Lights
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
     scene.add(ambientLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight1.position.set(50, 80, 50);
-    dirLight1.castShadow = true;
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.5);
+    dirLight1.position.set(40, 60, 80);
     scene.add(dirLight1);
 
-    const dirLight2 = new THREE.DirectionalLight(0x88aaff, 0.3);
-    dirLight2.position.set(-30, -20, 40);
+    const dirLight2 = new THREE.DirectionalLight(0x8899cc, 0.6);
+    dirLight2.position.set(-40, -30, 50);
     scene.add(dirLight2);
 
-    // Grid helper
+    // Rim light from below for edge definition
+    const dirLight3 = new THREE.DirectionalLight(0x445566, 0.4);
+    dirLight3.position.set(0, 0, -50);
+    scene.add(dirLight3);
+
+    // Grid + Axes
     const gridHelper = new THREE.GridHelper(100, 20, 0x444466, 0x333355);
-    gridHelper.rotation.x = Math.PI / 2; // XY plane
+    gridHelper.rotation.x = Math.PI / 2;
     scene.add(gridHelper);
+    scene.add(new THREE.AxesHelper(30));
 
-    // Axes helper
-    const axesHelper = new THREE.AxesHelper(30);
-    scene.add(axesHelper);
+    // PBR material for stock - metallic surface reveals tool marks via reflections
+    const stockMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      metalness: 0.85,
+      roughness: 0.25,
+      envMapIntensity: 1.0,
+    });
+    materialRef.current = stockMaterial;
 
-    // Handle resize
+    // Resize
     const handleResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
@@ -104,7 +140,8 @@ export function Viewer3D() {
   // Update stock mesh
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene) return;
+    const material = materialRef.current;
+    if (!scene || !material) return;
 
     if (stockMeshRef.current) {
       scene.remove(stockMeshRef.current);
@@ -112,15 +149,7 @@ export function Viewer3D() {
     }
 
     if (stockGeometry) {
-      const material = new THREE.MeshPhongMaterial({
-        vertexColors: true,
-        side: THREE.DoubleSide,
-        shininess: 60,
-        specular: 0x222222,
-      });
       const mesh = new THREE.Mesh(stockGeometry, material);
-      mesh.receiveShadow = true;
-      mesh.castShadow = true;
       scene.add(mesh);
       stockMeshRef.current = mesh;
     }
@@ -139,11 +168,7 @@ export function Viewer3D() {
       const tool = tools.find(t => t.id === currentToolId) ?? tools[0];
       if (tool) {
         const toolMesh = createToolMesh(
-          tool.type,
-          tool.diameter,
-          tool.cornerRadius,
-          tool.fluteLength
-        );
+          tool.type, tool.diameter, tool.cornerRadius, tool.fluteLength);
         toolMesh.position.set(toolPosition.x, toolPosition.y, toolPosition.z);
         scene.add(toolMesh);
         toolGroupRef.current = toolMesh;
@@ -172,7 +197,6 @@ export function Viewer3D() {
     const animate = () => {
       animFrameRef.current = requestAnimationFrame(animate);
 
-      // Run simulation steps if playing
       if (simState === 'playing') {
         tick();
       }
@@ -191,12 +215,7 @@ export function Viewer3D() {
   return (
     <div
       ref={containerRef}
-      style={{
-        width: '100%',
-        height: '100%',
-        position: 'relative',
-        overflow: 'hidden',
-      }}
+      style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}
     />
   );
 }

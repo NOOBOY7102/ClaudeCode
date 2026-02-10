@@ -52,7 +52,7 @@ interface AppState {
 export const useStore = create<AppState>((set, get) => ({
   // Initial state
   stockBBox: defaultStock,
-  resolution: 0.5,
+  resolution: 0.25,
   dexelModel: null,
   initialModel: null,
   tools: defaultTools,

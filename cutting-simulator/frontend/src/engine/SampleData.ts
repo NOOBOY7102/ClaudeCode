@@ -103,7 +103,7 @@ export function getDefaultGCode(): string {
   lines.push('M3 S18000');
   lines.push('G0 Z30');
 
-  const finishStep = 1.0;
+  const finishStep = 0.5;
   const finishZ = 3;
   for (let r = 2; r <= 30; r += finishStep) {
     // Move to start of circle
