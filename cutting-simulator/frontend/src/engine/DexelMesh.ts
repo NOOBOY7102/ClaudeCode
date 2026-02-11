@@ -2,25 +2,71 @@ import * as THREE from 'three';
 import { DexelModel } from './DexelModel';
 
 /**
- * Converts a DexelModel into a smooth heightmap mesh using indexed geometry.
+ * Tri-Dexel mesh generation.
  *
- * Key techniques for VERICUT-like smooth tool mark rendering:
- * 1. Shared vertices at cell centers -> continuous terrain surface
- * 2. Sobel-weighted central-difference normals -> smooth shading reveals scallops
- * 3. Indexed BufferGeometry -> efficient memory for high-resolution grids
- * 4. Step walls only where neighbor height differs significantly
+ * Produces 3 terrain-like heightmap meshes from the 3 orthogonal grids:
+ * - Z-grid → top surface (XY plane, "height" = Z)
+ * - X-grid → +X and -X side surfaces (YZ plane, "height" = X)
+ * - Y-grid → +Y and -Y side surfaces (XZ plane, "height" = Y)
+ *
+ * Each surface uses indexed BufferGeometry with Sobel-weighted normals
+ * for smooth shading that reveals tool scallop marks.
  */
 export function dexelToMesh(
   model: DexelModel,
   colorMode: 'solid' | 'heightmap' | 'difference' = 'solid',
-  targetModel?: DexelModel
+  _targetModel?: DexelModel
 ): THREE.BufferGeometry {
-  const { nx, ny, originX, originY, cellSize, segments } = model.grid;
-  const totalCells = nx * ny;
+  const allPos: number[] = [];
+  const allNrm: number[] = [];
+  const allCol: number[] = [];
+  const allIdx: number[] = [];
+  let baseVert = 0;
 
-  // --- Precompute per-cell data ---
+  // --- Z-grid: top surface ---
+  baseVert = buildZTopSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert);
+
+  // --- X-grid: +X side surface (max X values) ---
+  baseVert = buildXSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, true);
+
+  // --- X-grid: -X side surface (min X values) ---
+  baseVert = buildXSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, false);
+
+  // --- Y-grid: +Y side surface (max Y values) ---
+  baseVert = buildYSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, true);
+
+  // --- Y-grid: -Y side surface (min Y values) ---
+  buildYSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, false);
+
+  // --- Bottom surface (simple flat quad from Z-grid) ---
+  // Skipped for performance - bottom is rarely visible
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(allPos, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(allNrm, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(allCol, 3));
+  geometry.setIndex(allIdx);
+
+  return geometry;
+}
+
+// =================================================================
+// Z-grid top surface (existing heightmap approach)
+// =================================================================
+function buildZTopSurface(
+  model: DexelModel,
+  colorMode: string,
+  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
+  baseVert: number
+): number {
+  const { nx, ny } = model;
+  const cs = model.resolution;
+  const ox = model.bbox.minX;
+  const oy = model.bbox.minY;
+  const totalCells = nx * ny;
+  const segments = model.zGrid.segments;
+
   const topZ = new Float32Array(totalCells);
-  const botZ = new Float32Array(totalCells);
   const hasMat = new Uint8Array(totalCells);
   let zMin = 1e9, zMax = -1e9;
 
@@ -29,37 +75,31 @@ export function dexelToMesh(
     if (seg.length >= 2) {
       hasMat[i] = 1;
       topZ[i] = seg[seg.length - 1];
-      botZ[i] = seg[0];
       if (topZ[i] > zMax) zMax = topZ[i];
       if (topZ[i] < zMin) zMin = topZ[i];
     }
   }
   const zRange = zMax - zMin + 0.001;
 
-  // --- Vertex index map ---
+  // Vertex index map
   const vertIdx = new Int32Array(totalCells).fill(-1);
   let vertCount = 0;
   for (let i = 0; i < totalCells; i++) {
     if (hasMat[i]) vertIdx[i] = vertCount++;
   }
 
-  // --- Build vertex arrays ---
-  const pos = new Float32Array(vertCount * 3);
-  const nrm = new Float32Array(vertCount * 3);
-  const col = new Float32Array(vertCount * 3);
-
+  // Build vertices
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
       const ci = iy * nx + ix;
-      const vi = vertIdx[ci];
-      if (vi < 0) continue;
+      if (vertIdx[ci] < 0) continue;
 
-      const v3 = vi * 3;
-      pos[v3]     = originX + (ix + 0.5) * cellSize;
-      pos[v3 + 1] = originY + (iy + 0.5) * cellSize;
-      pos[v3 + 2] = topZ[ci];
+      const px = ox + (ix + 0.5) * cs;
+      const py = oy + (iy + 0.5) * cs;
+      const pz = topZ[ci];
+      allPos.push(px, py, pz);
 
-      // Sobel-weighted normal (3x3 kernel)
+      // Sobel normal
       const zC = topZ[ci];
       const zL  = (ix > 0      && hasMat[ci - 1])  ? topZ[ci - 1]  : zC;
       const zR  = (ix < nx - 1 && hasMat[ci + 1])  ? topZ[ci + 1]  : zC;
@@ -70,48 +110,19 @@ export function dexelToMesh(
       const zLU = (ix > 0      && iy < ny - 1 && hasMat[ci + nx - 1]) ? topZ[ci + nx - 1] : zC;
       const zRU = (ix < nx - 1 && iy < ny - 1 && hasMat[ci + nx + 1]) ? topZ[ci + nx + 1] : zC;
 
-      // Sobel: dz/dx = (zR + 2*zR_center + zRU - zL - 2*zL_center - zLU) / (8*cellSize)
-      const dzdx = ((zRD + 2 * zR + zRU) - (zLD + 2 * zL + zLU)) / (8 * cellSize);
-      const dzdy = ((zLU + 2 * zU + zRU) - (zLD + 2 * zD + zRD)) / (8 * cellSize);
+      const dzdx = ((zRD + 2 * zR + zRU) - (zLD + 2 * zL + zLU)) / (8 * cs);
+      const dzdy = ((zLU + 2 * zU + zRU) - (zLD + 2 * zD + zRD)) / (8 * cs);
 
       const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
-      nrm[v3]     = -dzdx / len;
-      nrm[v3 + 1] = -dzdy / len;
-      nrm[v3 + 2] = 1 / len;
+      allNrm.push(-dzdx / len, -dzdy / len, 1 / len);
 
       // Color
-      let cr: number, cg: number, cb: number;
-      if (colorMode === 'heightmap') {
-        [cr, cg, cb] = heatmapColor((topZ[ci] - zMin) / zRange);
-      } else if (colorMode === 'difference' && targetModel) {
-        const tSeg = targetModel.grid.segments[ci];
-        if (!tSeg || tSeg.length < 2) {
-          [cr, cg, cb] = [1.0, 0.3, 0.3];
-        } else {
-          const diff = topZ[ci] - tSeg[tSeg.length - 1];
-          if (diff > 0.05) {
-            const t = Math.min(1, diff / 2.0);
-            [cr, cg, cb] = [0.5 + 0.5 * t, 0.5 - 0.3 * t, 0.2];
-          } else if (diff < -0.05) {
-            const t = Math.min(1, -diff / 2.0);
-            [cr, cg, cb] = [0.2, 0.3, 0.5 + 0.5 * t];
-          } else {
-            [cr, cg, cb] = [0.3, 0.85, 0.4];
-          }
-        }
-      } else {
-        // Metallic aluminum: subtle height variation
-        const h = (topZ[ci] - zMin) / zRange;
-        cr = 0.78 + h * 0.07;
-        cg = 0.80 + h * 0.07;
-        cb = 0.83 + h * 0.07;
-      }
-      col[v3] = cr; col[v3 + 1] = cg; col[v3 + 2] = cb;
+      const c = surfaceColor(colorMode, topZ[ci], zMin, zRange);
+      allCol.push(c[0], c[1], c[2]);
     }
   }
 
-  // --- Top surface indices ---
-  const indices: number[] = [];
+  // Triangles
   for (let iy = 0; iy < ny - 1; iy++) {
     for (let ix = 0; ix < nx - 1; ix++) {
       const v00 = vertIdx[iy * nx + ix];
@@ -119,98 +130,234 @@ export function dexelToMesh(
       const v01 = vertIdx[(iy + 1) * nx + ix];
       const v11 = vertIdx[(iy + 1) * nx + ix + 1];
 
-      if (v00 >= 0 && v10 >= 0 && v01 >= 0) indices.push(v00, v10, v01);
-      if (v10 >= 0 && v11 >= 0 && v01 >= 0) indices.push(v10, v11, v01);
+      if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+        allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
+      if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+        allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
     }
   }
 
-  // --- Side walls (non-indexed, appended) ---
-  const wallPos: number[] = [];
-  const wallNrm: number[] = [];
-  const wallCol: number[] = [];
-  const thresh = cellSize * 0.15;
-
-  for (let iy = 0; iy < ny; iy++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iy * nx + ix;
-      if (!hasMat[ci]) continue;
-
-      const cx = originX + (ix + 0.5) * cellSize;
-      const cy = originY + (iy + 0.5) * cellSize;
-      const zt = topZ[ci];
-      const zb = botZ[ci];
-      const h = cellSize * 0.5;
-
-      // -X
-      const hasL = ix > 0 && hasMat[ci - 1];
-      if (!hasL) {
-        pushWall(wallPos, wallNrm, wallCol, cx-h,cy-h, cx-h,cy+h, zb, zt, -1,0,0);
-      } else if (zt - topZ[ci-1] > thresh) {
-        pushWall(wallPos, wallNrm, wallCol, cx-h,cy-h, cx-h,cy+h, topZ[ci-1], zt, -1,0,0);
-      }
-      // +X
-      const hasR = ix < nx-1 && hasMat[ci + 1];
-      if (!hasR) {
-        pushWall(wallPos, wallNrm, wallCol, cx+h,cy+h, cx+h,cy-h, zb, zt, 1,0,0);
-      } else if (zt - topZ[ci+1] > thresh) {
-        pushWall(wallPos, wallNrm, wallCol, cx+h,cy+h, cx+h,cy-h, topZ[ci+1], zt, 1,0,0);
-      }
-      // -Y
-      const hasD = iy > 0 && hasMat[ci - nx];
-      if (!hasD) {
-        pushWall(wallPos, wallNrm, wallCol, cx+h,cy-h, cx-h,cy-h, zb, zt, 0,-1,0);
-      } else if (zt - topZ[ci-nx] > thresh) {
-        pushWall(wallPos, wallNrm, wallCol, cx+h,cy-h, cx-h,cy-h, topZ[ci-nx], zt, 0,-1,0);
-      }
-      // +Y
-      const hasU = iy < ny-1 && hasMat[ci + nx];
-      if (!hasU) {
-        pushWall(wallPos, wallNrm, wallCol, cx-h,cy+h, cx+h,cy+h, zb, zt, 0,1,0);
-      } else if (zt - topZ[ci+nx] > thresh) {
-        pushWall(wallPos, wallNrm, wallCol, cx-h,cy+h, cx+h,cy+h, topZ[ci+nx], zt, 0,1,0);
-      }
-    }
-  }
-
-  // --- Merge into single geometry ---
-  const wallVerts = wallPos.length / 3;
-  const totalVerts = vertCount + wallVerts;
-  const finalPos = new Float32Array(totalVerts * 3);
-  const finalNrm = new Float32Array(totalVerts * 3);
-  const finalCol = new Float32Array(totalVerts * 3);
-
-  finalPos.set(pos); finalNrm.set(nrm); finalCol.set(col);
-  for (let i = 0; i < wallVerts * 3; i++) {
-    finalPos[vertCount * 3 + i] = wallPos[i];
-    finalNrm[vertCount * 3 + i] = wallNrm[i];
-    finalCol[vertCount * 3 + i] = wallCol[i];
-  }
-  // Wall triangles as indices
-  for (let i = 0; i < wallVerts; i++) {
-    indices.push(vertCount + i);
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(finalPos, 3));
-  geometry.setAttribute('normal', new THREE.BufferAttribute(finalNrm, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(finalCol, 3));
-  geometry.setIndex(indices);
-
-  return geometry;
+  return baseVert + vertCount;
 }
 
-// --- Helpers ---
+// =================================================================
+// X-grid side surface (+X or -X)
+// =================================================================
+function buildXSurface(
+  model: DexelModel,
+  colorMode: string,
+  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
+  baseVert: number,
+  isMax: boolean
+): number {
+  const { ny, nz } = model;
+  const cs = model.resolution;
+  const oy = model.bbox.minY;
+  const oz = model.bbox.minZ;
+  const totalCells = ny * nz;
 
-function pushWall(
-  p: number[], n: number[], c: number[],
-  x0: number, y0: number, x1: number, y1: number,
-  zBot: number, zTop: number,
-  wnx: number, wny: number, wnz: number
-) {
-  const g = 0.55;
-  p.push(x0,y0,zBot, x1,y1,zBot, x1,y1,zTop);
-  p.push(x0,y0,zBot, x1,y1,zTop, x0,y0,zTop);
-  for (let i = 0; i < 6; i++) { n.push(wnx,wny,wnz); c.push(g, g, g+0.03); }
+  // Extract surface values: for +X use max X (last seg end), for -X use min X (first seg start)
+  const valArr = new Float32Array(totalCells);
+  const hasMat = new Uint8Array(totalCells);
+  let vMin = 1e9, vMax = -1e9;
+
+  for (let iz = 0; iz < nz; iz++) {
+    for (let iy = 0; iy < ny; iy++) {
+      const idx = iz * ny + iy;
+      const seg = model.xGrid.segments[idx];
+      if (seg.length >= 2) {
+        hasMat[idx] = 1;
+        const v = isMax ? seg[seg.length - 1] : seg[0];
+        valArr[idx] = v;
+        if (v > vMax) vMax = v;
+        if (v < vMin) vMin = v;
+      }
+    }
+  }
+  const vRange = vMax - vMin + 0.001;
+
+  // Vertex index map
+  const vertIdx = new Int32Array(totalCells).fill(-1);
+  let vertCount = 0;
+  for (let i = 0; i < totalCells; i++) {
+    if (hasMat[i]) vertIdx[i] = vertCount++;
+  }
+
+  // Build vertices (position in world: X = valArr, Y = cellY, Z = cellZ)
+  for (let iz = 0; iz < nz; iz++) {
+    for (let iy = 0; iy < ny; iy++) {
+      const ci = iz * ny + iy;
+      if (vertIdx[ci] < 0) continue;
+
+      const py = oy + (iy + 0.5) * cs;
+      const pz = oz + (iz + 0.5) * cs;
+      const px = valArr[ci];
+      allPos.push(px, py, pz);
+
+      // Sobel normal in YZ plane: compute dX/dY and dX/dZ
+      const xC = valArr[ci];
+      const xL  = (iy > 0      && hasMat[ci - 1])    ? valArr[ci - 1]    : xC;
+      const xR  = (iy < ny - 1 && hasMat[ci + 1])    ? valArr[ci + 1]    : xC;
+      const xD  = (iz > 0      && hasMat[ci - ny])    ? valArr[ci - ny]    : xC;
+      const xU  = (iz < nz - 1 && hasMat[ci + ny])    ? valArr[ci + ny]    : xC;
+      const xLD = (iy > 0      && iz > 0      && hasMat[ci - ny - 1]) ? valArr[ci - ny - 1] : xC;
+      const xRD = (iy < ny - 1 && iz > 0      && hasMat[ci - ny + 1]) ? valArr[ci - ny + 1] : xC;
+      const xLU = (iy > 0      && iz < nz - 1 && hasMat[ci + ny - 1]) ? valArr[ci + ny - 1] : xC;
+      const xRU = (iy < ny - 1 && iz < nz - 1 && hasMat[ci + ny + 1]) ? valArr[ci + ny + 1] : xC;
+
+      const dxdy = ((xRD + 2 * xR + xRU) - (xLD + 2 * xL + xLU)) / (8 * cs);
+      const dxdz = ((xLU + 2 * xU + xRU) - (xLD + 2 * xD + xRD)) / (8 * cs);
+
+      // Normal for X surface: n = normalize(±1, -dxdy, -dxdz)
+      const sign = isMax ? 1 : -1;
+      const len = Math.sqrt(1 + dxdy * dxdy + dxdz * dxdz);
+      allNrm.push(sign / len, -sign * dxdy / len, -sign * dxdz / len);
+
+      const c = surfaceColor(colorMode, valArr[ci], vMin, vRange);
+      allCol.push(c[0], c[1], c[2]);
+    }
+  }
+
+  // Triangles (in YZ grid)
+  for (let iz = 0; iz < nz - 1; iz++) {
+    for (let iy = 0; iy < ny - 1; iy++) {
+      const v00 = vertIdx[iz * ny + iy];
+      const v10 = vertIdx[iz * ny + iy + 1];
+      const v01 = vertIdx[(iz + 1) * ny + iy];
+      const v11 = vertIdx[(iz + 1) * ny + iy + 1];
+
+      if (isMax) {
+        // +X face: outward normal along +X
+        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
+        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
+      } else {
+        // -X face: outward normal along -X (reverse winding)
+        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
+        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
+      }
+    }
+  }
+
+  return baseVert + vertCount;
+}
+
+// =================================================================
+// Y-grid side surface (+Y or -Y)
+// =================================================================
+function buildYSurface(
+  model: DexelModel,
+  colorMode: string,
+  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
+  baseVert: number,
+  isMax: boolean
+): number {
+  const { nx, nz } = model;
+  const cs = model.resolution;
+  const oxx = model.bbox.minX;
+  const oz = model.bbox.minZ;
+  const totalCells = nx * nz;
+
+  const valArr = new Float32Array(totalCells);
+  const hasMat = new Uint8Array(totalCells);
+  let vMin = 1e9, vMax = -1e9;
+
+  for (let iz = 0; iz < nz; iz++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const idx = iz * nx + ix;
+      const seg = model.yGrid.segments[idx];
+      if (seg.length >= 2) {
+        hasMat[idx] = 1;
+        const v = isMax ? seg[seg.length - 1] : seg[0];
+        valArr[idx] = v;
+        if (v > vMax) vMax = v;
+        if (v < vMin) vMin = v;
+      }
+    }
+  }
+  const vRange = vMax - vMin + 0.001;
+
+  const vertIdx = new Int32Array(totalCells).fill(-1);
+  let vertCount = 0;
+  for (let i = 0; i < totalCells; i++) {
+    if (hasMat[i]) vertIdx[i] = vertCount++;
+  }
+
+  // Build vertices (position in world: X = cellX, Y = valArr, Z = cellZ)
+  for (let iz = 0; iz < nz; iz++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const ci = iz * nx + ix;
+      if (vertIdx[ci] < 0) continue;
+
+      const px = oxx + (ix + 0.5) * cs;
+      const pz = oz + (iz + 0.5) * cs;
+      const py = valArr[ci];
+      allPos.push(px, py, pz);
+
+      // Sobel normal in XZ plane: compute dY/dX and dY/dZ
+      const yC = valArr[ci];
+      const yL  = (ix > 0      && hasMat[ci - 1])    ? valArr[ci - 1]    : yC;
+      const yR  = (ix < nx - 1 && hasMat[ci + 1])    ? valArr[ci + 1]    : yC;
+      const yD  = (iz > 0      && hasMat[ci - nx])    ? valArr[ci - nx]    : yC;
+      const yU  = (iz < nz - 1 && hasMat[ci + nx])    ? valArr[ci + nx]    : yC;
+      const yLD = (ix > 0      && iz > 0      && hasMat[ci - nx - 1]) ? valArr[ci - nx - 1] : yC;
+      const yRD = (ix < nx - 1 && iz > 0      && hasMat[ci - nx + 1]) ? valArr[ci - nx + 1] : yC;
+      const yLU = (ix > 0      && iz < nz - 1 && hasMat[ci + nx - 1]) ? valArr[ci + nx - 1] : yC;
+      const yRU = (ix < nx - 1 && iz < nz - 1 && hasMat[ci + nx + 1]) ? valArr[ci + nx + 1] : yC;
+
+      const dydx = ((yRD + 2 * yR + yRU) - (yLD + 2 * yL + yLU)) / (8 * cs);
+      const dydz = ((yLU + 2 * yU + yRU) - (yLD + 2 * yD + yRD)) / (8 * cs);
+
+      const sign = isMax ? 1 : -1;
+      const len = Math.sqrt(dydx * dydx + 1 + dydz * dydz);
+      allNrm.push(-sign * dydx / len, sign / len, -sign * dydz / len);
+
+      const c = surfaceColor(colorMode, valArr[ci], vMin, vRange);
+      allCol.push(c[0], c[1], c[2]);
+    }
+  }
+
+  // Triangles (in XZ grid)
+  for (let iz = 0; iz < nz - 1; iz++) {
+    for (let ix = 0; ix < nx - 1; ix++) {
+      const v00 = vertIdx[iz * nx + ix];
+      const v10 = vertIdx[iz * nx + ix + 1];
+      const v01 = vertIdx[(iz + 1) * nx + ix];
+      const v11 = vertIdx[(iz + 1) * nx + ix + 1];
+
+      if (isMax) {
+        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
+        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
+      } else {
+        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
+        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+          allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
+      }
+    }
+  }
+
+  return baseVert + vertCount;
+}
+
+// =================================================================
+// Shared helpers
+// =================================================================
+
+function surfaceColor(
+  colorMode: string, val: number, valMin: number, valRange: number
+): [number, number, number] {
+  if (colorMode === 'heightmap') {
+    return heatmapColor((val - valMin) / valRange);
+  }
+  // Metallic aluminum with subtle variation
+  const h = (val - valMin) / valRange;
+  return [0.78 + h * 0.07, 0.80 + h * 0.07, 0.83 + h * 0.07];
 }
 
 function heatmapColor(t: number): [number, number, number] {
