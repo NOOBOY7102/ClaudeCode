@@ -4,13 +4,12 @@ import { DexelModel } from './DexelModel';
 /**
  * Tri-Dexel mesh generation.
  *
- * Produces 3 terrain-like heightmap meshes from the 3 orthogonal grids:
- * - Z-grid → top surface (XY plane, "height" = Z)
- * - X-grid → +X and -X side surfaces (YZ plane, "height" = X)
- * - Y-grid → +Y and -Y side surfaces (XZ plane, "height" = Y)
+ * - Z-grid → top surface heightmap (Sobel normals, smooth shading)
+ * - Z-grid boundary analysis → side walls (at material/air transitions)
  *
- * Each surface uses indexed BufferGeometry with Sobel-weighted normals
- * for smooth shading that reveals tool scallop marks.
+ * The X/Y dexel grids improve simulation accuracy but are NOT used for
+ * rendering directly (they produce interior faces). Instead, side walls
+ * are generated from Z-grid boundary detection.
  */
 export function dexelToMesh(
   model: DexelModel,
@@ -26,20 +25,11 @@ export function dexelToMesh(
   // --- Z-grid: top surface ---
   baseVert = buildZTopSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert);
 
-  // --- X-grid: +X side surface (max X values) ---
-  baseVert = buildXSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, true);
+  // --- Z-grid: bottom surface ---
+  baseVert = buildZBottomSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert);
 
-  // --- X-grid: -X side surface (min X values) ---
-  baseVert = buildXSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, false);
-
-  // --- Y-grid: +Y side surface (max Y values) ---
-  baseVert = buildYSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, true);
-
-  // --- Y-grid: -Y side surface (min Y values) ---
-  buildYSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert, false);
-
-  // --- Bottom surface (simple flat quad from Z-grid) ---
-  // Skipped for performance - bottom is rarely visible
+  // --- Side walls from Z-grid boundary analysis ---
+  buildSideWalls(model, allPos, allNrm, allCol, allIdx, baseVert);
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(allPos, 3));
@@ -51,7 +41,7 @@ export function dexelToMesh(
 }
 
 // =================================================================
-// Z-grid top surface (existing heightmap approach)
+// Z-grid top surface
 // =================================================================
 function buildZTopSurface(
   model: DexelModel,
@@ -81,25 +71,20 @@ function buildZTopSurface(
   }
   const zRange = zMax - zMin + 0.001;
 
-  // Vertex index map
   const vertIdx = new Int32Array(totalCells).fill(-1);
   let vertCount = 0;
   for (let i = 0; i < totalCells; i++) {
     if (hasMat[i]) vertIdx[i] = vertCount++;
   }
 
-  // Build vertices
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
       const ci = iy * nx + ix;
       if (vertIdx[ci] < 0) continue;
 
-      const px = ox + (ix + 0.5) * cs;
-      const py = oy + (iy + 0.5) * cs;
-      const pz = topZ[ci];
-      allPos.push(px, py, pz);
+      allPos.push(ox + (ix + 0.5) * cs, oy + (iy + 0.5) * cs, topZ[ci]);
 
-      // Sobel normal
+      // Sobel 3x3 normal
       const zC = topZ[ci];
       const zL  = (ix > 0      && hasMat[ci - 1])  ? topZ[ci - 1]  : zC;
       const zR  = (ix < nx - 1 && hasMat[ci + 1])  ? topZ[ci + 1]  : zC;
@@ -112,24 +97,20 @@ function buildZTopSurface(
 
       const dzdx = ((zRD + 2 * zR + zRU) - (zLD + 2 * zL + zLU)) / (8 * cs);
       const dzdy = ((zLU + 2 * zU + zRU) - (zLD + 2 * zD + zRD)) / (8 * cs);
-
       const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
       allNrm.push(-dzdx / len, -dzdy / len, 1 / len);
 
-      // Color
       const c = surfaceColor(colorMode, topZ[ci], zMin, zRange);
       allCol.push(c[0], c[1], c[2]);
     }
   }
 
-  // Triangles
   for (let iy = 0; iy < ny - 1; iy++) {
     for (let ix = 0; ix < nx - 1; ix++) {
       const v00 = vertIdx[iy * nx + ix];
       const v10 = vertIdx[iy * nx + ix + 1];
       const v01 = vertIdx[(iy + 1) * nx + ix];
       const v11 = vertIdx[(iy + 1) * nx + ix + 1];
-
       if (v00 >= 0 && v10 >= 0 && v01 >= 0)
         allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
       if (v10 >= 0 && v11 >= 0 && v01 >= 0)
@@ -141,104 +122,74 @@ function buildZTopSurface(
 }
 
 // =================================================================
-// X-grid side surface (+X or -X)
+// Z-grid bottom surface (inverted normals)
 // =================================================================
-function buildXSurface(
+function buildZBottomSurface(
   model: DexelModel,
-  colorMode: string,
+  _colorMode: string,
   allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
-  baseVert: number,
-  isMax: boolean
+  baseVert: number
 ): number {
-  const { ny, nz } = model;
+  const { nx, ny } = model;
   const cs = model.resolution;
+  const ox = model.bbox.minX;
   const oy = model.bbox.minY;
-  const oz = model.bbox.minZ;
-  const totalCells = ny * nz;
+  const totalCells = nx * ny;
+  const segments = model.zGrid.segments;
 
-  // Extract surface values: for +X use max X (last seg end), for -X use min X (first seg start)
-  const valArr = new Float32Array(totalCells);
+  const botZ = new Float32Array(totalCells);
   const hasMat = new Uint8Array(totalCells);
-  let vMin = 1e9, vMax = -1e9;
 
-  for (let iz = 0; iz < nz; iz++) {
-    for (let iy = 0; iy < ny; iy++) {
-      const idx = iz * ny + iy;
-      const seg = model.xGrid.segments[idx];
-      if (seg.length >= 2) {
-        hasMat[idx] = 1;
-        const v = isMax ? seg[seg.length - 1] : seg[0];
-        valArr[idx] = v;
-        if (v > vMax) vMax = v;
-        if (v < vMin) vMin = v;
-      }
+  for (let i = 0; i < totalCells; i++) {
+    const seg = segments[i];
+    if (seg.length >= 2) {
+      hasMat[i] = 1;
+      botZ[i] = seg[0];
     }
   }
-  const vRange = vMax - vMin + 0.001;
 
-  // Vertex index map
   const vertIdx = new Int32Array(totalCells).fill(-1);
   let vertCount = 0;
-  for (let i = 0; i < totalCells; i++) {
-    if (hasMat[i]) vertIdx[i] = vertCount++;
-  }
 
-  // Build vertices (position in world: X = valArr, Y = cellY, Z = cellZ)
-  for (let iz = 0; iz < nz; iz++) {
-    for (let iy = 0; iy < ny; iy++) {
-      const ci = iz * ny + iy;
-      if (vertIdx[ci] < 0) continue;
-
-      const py = oy + (iy + 0.5) * cs;
-      const pz = oz + (iz + 0.5) * cs;
-      const px = valArr[ci];
-      allPos.push(px, py, pz);
-
-      // Sobel normal in YZ plane: compute dX/dY and dX/dZ
-      const xC = valArr[ci];
-      const xL  = (iy > 0      && hasMat[ci - 1])    ? valArr[ci - 1]    : xC;
-      const xR  = (iy < ny - 1 && hasMat[ci + 1])    ? valArr[ci + 1]    : xC;
-      const xD  = (iz > 0      && hasMat[ci - ny])    ? valArr[ci - ny]    : xC;
-      const xU  = (iz < nz - 1 && hasMat[ci + ny])    ? valArr[ci + ny]    : xC;
-      const xLD = (iy > 0      && iz > 0      && hasMat[ci - ny - 1]) ? valArr[ci - ny - 1] : xC;
-      const xRD = (iy < ny - 1 && iz > 0      && hasMat[ci - ny + 1]) ? valArr[ci - ny + 1] : xC;
-      const xLU = (iy > 0      && iz < nz - 1 && hasMat[ci + ny - 1]) ? valArr[ci + ny - 1] : xC;
-      const xRU = (iy < ny - 1 && iz < nz - 1 && hasMat[ci + ny + 1]) ? valArr[ci + ny + 1] : xC;
-
-      const dxdy = ((xRD + 2 * xR + xRU) - (xLD + 2 * xL + xLU)) / (8 * cs);
-      const dxdz = ((xLU + 2 * xU + xRU) - (xLD + 2 * xD + xRD)) / (8 * cs);
-
-      // Normal for X surface: n = normalize(±1, -dxdy, -dxdz)
-      const sign = isMax ? 1 : -1;
-      const len = Math.sqrt(1 + dxdy * dxdy + dxdz * dxdz);
-      allNrm.push(sign / len, -sign * dxdy / len, -sign * dxdz / len);
-
-      const c = surfaceColor(colorMode, valArr[ci], vMin, vRange);
-      allCol.push(c[0], c[1], c[2]);
+  // Only add bottom surface vertices at boundary cells (where neighbors differ or are empty)
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const ci = iy * nx + ix;
+      if (!hasMat[ci]) continue;
+      // Check if this cell is near a boundary or has a different bottom from stock
+      const isEdge = ix === 0 || ix === nx - 1 || iy === 0 || iy === ny - 1;
+      const hasEmptyNeighbor =
+        (ix > 0 && !hasMat[ci - 1]) || (ix < nx - 1 && !hasMat[ci + 1]) ||
+        (iy > 0 && !hasMat[ci - nx]) || (iy < ny - 1 && !hasMat[ci + nx]);
+      if (isEdge || hasEmptyNeighbor) {
+        vertIdx[ci] = vertCount++;
+      }
     }
   }
 
-  // Triangles (in YZ grid)
-  for (let iz = 0; iz < nz - 1; iz++) {
-    for (let iy = 0; iy < ny - 1; iy++) {
-      const v00 = vertIdx[iz * ny + iy];
-      const v10 = vertIdx[iz * ny + iy + 1];
-      const v01 = vertIdx[(iz + 1) * ny + iy];
-      const v11 = vertIdx[(iz + 1) * ny + iy + 1];
+  const g = 0.45; // darker color for bottom
 
-      if (isMax) {
-        // +X face: outward normal along +X
-        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
-        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
-      } else {
-        // -X face: outward normal along -X (reverse winding)
-        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
-        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
-      }
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const ci = iy * nx + ix;
+      if (vertIdx[ci] < 0) continue;
+      allPos.push(ox + (ix + 0.5) * cs, oy + (iy + 0.5) * cs, botZ[ci]);
+      allNrm.push(0, 0, -1);
+      allCol.push(g, g, g + 0.03);
+    }
+  }
+
+  for (let iy = 0; iy < ny - 1; iy++) {
+    for (let ix = 0; ix < nx - 1; ix++) {
+      const v00 = vertIdx[iy * nx + ix];
+      const v10 = vertIdx[iy * nx + ix + 1];
+      const v01 = vertIdx[(iy + 1) * nx + ix];
+      const v11 = vertIdx[(iy + 1) * nx + ix + 1];
+      // Reverse winding for bottom face
+      if (v00 >= 0 && v10 >= 0 && v01 >= 0)
+        allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
+      if (v10 >= 0 && v11 >= 0 && v01 >= 0)
+        allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
     }
   }
 
@@ -246,103 +197,119 @@ function buildXSurface(
 }
 
 // =================================================================
-// Y-grid side surface (+Y or -Y)
+// Side walls from Z-grid boundary detection
 // =================================================================
-function buildYSurface(
+function buildSideWalls(
   model: DexelModel,
-  colorMode: string,
   allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
-  baseVert: number,
-  isMax: boolean
+  baseVert: number
 ): number {
-  const { nx, nz } = model;
+  const { nx, ny } = model;
   const cs = model.resolution;
-  const oxx = model.bbox.minX;
-  const oz = model.bbox.minZ;
-  const totalCells = nx * nz;
+  const ox = model.bbox.minX;
+  const oy = model.bbox.minY;
+  const segments = model.zGrid.segments;
+  const totalCells = nx * ny;
 
-  const valArr = new Float32Array(totalCells);
+  const topZ = new Float32Array(totalCells);
+  const botZ = new Float32Array(totalCells);
   const hasMat = new Uint8Array(totalCells);
-  let vMin = 1e9, vMax = -1e9;
 
-  for (let iz = 0; iz < nz; iz++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const idx = iz * nx + ix;
-      const seg = model.yGrid.segments[idx];
-      if (seg.length >= 2) {
-        hasMat[idx] = 1;
-        const v = isMax ? seg[seg.length - 1] : seg[0];
-        valArr[idx] = v;
-        if (v > vMax) vMax = v;
-        if (v < vMin) vMin = v;
-      }
-    }
-  }
-  const vRange = vMax - vMin + 0.001;
-
-  const vertIdx = new Int32Array(totalCells).fill(-1);
-  let vertCount = 0;
   for (let i = 0; i < totalCells; i++) {
-    if (hasMat[i]) vertIdx[i] = vertCount++;
-  }
-
-  // Build vertices (position in world: X = cellX, Y = valArr, Z = cellZ)
-  for (let iz = 0; iz < nz; iz++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iz * nx + ix;
-      if (vertIdx[ci] < 0) continue;
-
-      const px = oxx + (ix + 0.5) * cs;
-      const pz = oz + (iz + 0.5) * cs;
-      const py = valArr[ci];
-      allPos.push(px, py, pz);
-
-      // Sobel normal in XZ plane: compute dY/dX and dY/dZ
-      const yC = valArr[ci];
-      const yL  = (ix > 0      && hasMat[ci - 1])    ? valArr[ci - 1]    : yC;
-      const yR  = (ix < nx - 1 && hasMat[ci + 1])    ? valArr[ci + 1]    : yC;
-      const yD  = (iz > 0      && hasMat[ci - nx])    ? valArr[ci - nx]    : yC;
-      const yU  = (iz < nz - 1 && hasMat[ci + nx])    ? valArr[ci + nx]    : yC;
-      const yLD = (ix > 0      && iz > 0      && hasMat[ci - nx - 1]) ? valArr[ci - nx - 1] : yC;
-      const yRD = (ix < nx - 1 && iz > 0      && hasMat[ci - nx + 1]) ? valArr[ci - nx + 1] : yC;
-      const yLU = (ix > 0      && iz < nz - 1 && hasMat[ci + nx - 1]) ? valArr[ci + nx - 1] : yC;
-      const yRU = (ix < nx - 1 && iz < nz - 1 && hasMat[ci + nx + 1]) ? valArr[ci + nx + 1] : yC;
-
-      const dydx = ((yRD + 2 * yR + yRU) - (yLD + 2 * yL + yLU)) / (8 * cs);
-      const dydz = ((yLU + 2 * yU + yRU) - (yLD + 2 * yD + yRD)) / (8 * cs);
-
-      const sign = isMax ? 1 : -1;
-      const len = Math.sqrt(dydx * dydx + 1 + dydz * dydz);
-      allNrm.push(-sign * dydx / len, sign / len, -sign * dydz / len);
-
-      const c = surfaceColor(colorMode, valArr[ci], vMin, vRange);
-      allCol.push(c[0], c[1], c[2]);
+    const seg = segments[i];
+    if (seg.length >= 2) {
+      hasMat[i] = 1;
+      topZ[i] = seg[seg.length - 1];
+      botZ[i] = seg[0];
     }
   }
 
-  // Triangles (in XZ grid)
-  for (let iz = 0; iz < nz - 1; iz++) {
-    for (let ix = 0; ix < nx - 1; ix++) {
-      const v00 = vertIdx[iz * nx + ix];
-      const v10 = vertIdx[iz * nx + ix + 1];
-      const v01 = vertIdx[(iz + 1) * nx + ix];
-      const v11 = vertIdx[(iz + 1) * nx + ix + 1];
+  const g = 0.55; // wall color (slightly darker than top)
+  let vIdx = baseVert;
 
-      if (isMax) {
-        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
-        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
-      } else {
-        if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
-        if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-          allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
+  // For each cell, check 4 neighbors. Generate wall quads at boundaries.
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const ci = iy * nx + ix;
+      if (!hasMat[ci]) continue;
+
+      const cx = ox + (ix + 0.5) * cs;
+      const cy = oy + (iy + 0.5) * cs;
+      const zt = topZ[ci];
+      const zb = botZ[ci];
+      const h = cs * 0.5;
+
+      // -X wall
+      if (ix === 0 || !hasMat[ci - 1]) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx - h, cy - h, cx - h, cy + h, zb, zt, -1, 0, 0, g, vIdx);
+        vIdx += 4;
+      } else if (topZ[ci - 1] < zt - cs * 0.1) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx - h, cy - h, cx - h, cy + h, topZ[ci - 1], zt, -1, 0, 0, g, vIdx);
+        vIdx += 4;
+      }
+
+      // +X wall
+      if (ix === nx - 1 || !hasMat[ci + 1]) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx + h, cy + h, cx + h, cy - h, zb, zt, 1, 0, 0, g, vIdx);
+        vIdx += 4;
+      } else if (topZ[ci + 1] < zt - cs * 0.1) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx + h, cy + h, cx + h, cy - h, topZ[ci + 1], zt, 1, 0, 0, g, vIdx);
+        vIdx += 4;
+      }
+
+      // -Y wall
+      if (iy === 0 || !hasMat[ci - nx]) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx + h, cy - h, cx - h, cy - h, zb, zt, 0, -1, 0, g, vIdx);
+        vIdx += 4;
+      } else if (topZ[ci - nx] < zt - cs * 0.1) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx + h, cy - h, cx - h, cy - h, topZ[ci - nx], zt, 0, -1, 0, g, vIdx);
+        vIdx += 4;
+      }
+
+      // +Y wall
+      if (iy === ny - 1 || !hasMat[ci + nx]) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx - h, cy + h, cx + h, cy + h, zb, zt, 0, 1, 0, g, vIdx);
+        vIdx += 4;
+      } else if (topZ[ci + nx] < zt - cs * 0.1) {
+        pushWallQuad(allPos, allNrm, allCol, allIdx,
+          cx - h, cy + h, cx + h, cy + h, topZ[ci + nx], zt, 0, 1, 0, g, vIdx);
+        vIdx += 4;
       }
     }
   }
 
-  return baseVert + vertCount;
+  return vIdx;
+}
+
+/** Push an indexed wall quad (4 vertices, 2 triangles) */
+function pushWallQuad(
+  pos: number[], nrm: number[], col: number[], idx: number[],
+  x0: number, y0: number, x1: number, y1: number,
+  zBot: number, zTop: number,
+  wnx: number, wny: number, wnz: number,
+  g: number, baseIdx: number
+): void {
+  // 4 vertices: bottom-left, bottom-right, top-right, top-left
+  pos.push(x0, y0, zBot);
+  pos.push(x1, y1, zBot);
+  pos.push(x1, y1, zTop);
+  pos.push(x0, y0, zTop);
+
+  for (let i = 0; i < 4; i++) {
+    nrm.push(wnx, wny, wnz);
+    col.push(g, g, g + 0.03);
+  }
+
+  // Two triangles: 0-1-2, 0-2-3
+  idx.push(baseIdx, baseIdx + 1, baseIdx + 2);
+  idx.push(baseIdx, baseIdx + 2, baseIdx + 3);
 }
 
 // =================================================================
@@ -355,7 +322,6 @@ function surfaceColor(
   if (colorMode === 'heightmap') {
     return heatmapColor((val - valMin) / valRange);
   }
-  // Metallic aluminum with subtle variation
   const h = (val - valMin) / valRange;
   return [0.78 + h * 0.07, 0.80 + h * 0.07, 0.83 + h * 0.07];
 }
