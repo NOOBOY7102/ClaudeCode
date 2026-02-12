@@ -19,6 +19,7 @@ export function Viewer3D() {
   const {
     stockMesh: stockGeometry,
     toolPosition,
+    toolAxis,
     currentToolId,
     tools,
     toolpath,
@@ -170,11 +171,20 @@ export function Viewer3D() {
         const toolMesh = createToolMesh(
           tool.type, tool.diameter, tool.cornerRadius, tool.fluteLength);
         toolMesh.position.set(toolPosition.x, toolPosition.y, toolPosition.z);
+
+        // 5-axis: tilt tool to match axis direction
+        if (toolAxis) {
+          const dir = new THREE.Vector3(toolAxis.ai, toolAxis.aj, toolAxis.ak).normalize();
+          const up = new THREE.Vector3(0, 0, 1);
+          const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
+          toolMesh.quaternion.copy(quat);
+        }
+
         scene.add(toolMesh);
         toolGroupRef.current = toolMesh;
       }
     }
-  }, [toolPosition, currentToolId, showTool, tools]);
+  }, [toolPosition, toolAxis, currentToolId, showTool, tools]);
 
   // Update toolpath lines
   useEffect(() => {

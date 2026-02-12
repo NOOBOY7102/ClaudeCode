@@ -181,7 +181,7 @@ export class DexelModel {
 
   /**
    * Subtract a tool swept volume from all 3 dexel grids.
-   * Tool moves linearly from p0 to p1.
+   * Tool moves linearly from p0 to p1 (3-axis, vertical tool).
    */
   subtractToolLinear(
     p0x: number, p0y: number, p0z: number,
@@ -193,6 +193,131 @@ export class DexelModel {
     this.subtractToolZ(p0x, p0y, p0z, p1x, p1y, p1z, toolRadius, cornerRadius, toolLength);
     this.subtractToolX(p0x, p0y, p0z, p1x, p1y, p1z, toolRadius, cornerRadius, toolLength);
     this.subtractToolY(p0x, p0y, p0z, p1x, p1y, p1z, toolRadius, cornerRadius, toolLength);
+  }
+
+  /**
+   * 5-axis tool subtraction using sphere decomposition.
+   * The tool is decomposed into spheres along the tilted axis.
+   * For ball end mills this is exact; for flat/bull_nose it's an approximation.
+   */
+  subtractToolLinear5Axis(
+    p0x: number, p0y: number, p0z: number,
+    p1x: number, p1y: number, p1z: number,
+    ai0: number, aj0: number, ak0: number,
+    ai1: number, aj1: number, ak1: number,
+    toolRadius: number,
+    cornerRadius: number,
+    fluteLength: number
+  ): void {
+    // Number of path samples
+    const dx = p1x - p0x, dy = p1y - p0y, dz = p1z - p0z;
+    const pathLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const pathSteps = Math.max(1, Math.ceil(pathLen / (toolRadius * 0.5)));
+
+    // Number of spheres along tool axis
+    const sphereR = cornerRadius > 0 ? Math.min(cornerRadius, toolRadius) : toolRadius * 0.4;
+    const axisSteps = Math.max(2, Math.ceil(fluteLength / (sphereR * 0.8)));
+
+    for (let ps = 0; ps <= pathSteps; ps++) {
+      const t = ps / pathSteps;
+      const px = p0x + t * dx;
+      const py = p0y + t * dy;
+      const pz = p0z + t * dz;
+      // Interpolate axis direction
+      const ai = ai0 + t * (ai1 - ai0);
+      const aj = aj0 + t * (aj1 - aj0);
+      const ak = ak0 + t * (ak1 - ak0);
+      // Normalize
+      const aLen = Math.sqrt(ai * ai + aj * aj + ak * ak);
+      const nai = ai / aLen, naj = aj / aLen, nak = ak / aLen;
+
+      // Place spheres along the tool axis
+      for (let as = 0; as <= axisSteps; as++) {
+        const h = (as / axisSteps) * fluteLength;
+        // Tool cross-section radius at height h
+        const rAtH = toolRadiusAtHeightExported(h, toolRadius, cornerRadius, fluteLength);
+        if (rAtH <= 0) continue;
+
+        // Sphere center
+        const sx = px + nai * h;
+        const sy = py + naj * h;
+        const sz = pz + nak * h;
+
+        // Subtract sphere from all 3 grids
+        this.subtractSphere(sx, sy, sz, rAtH);
+      }
+    }
+  }
+
+  /**
+   * Subtract a sphere from all 3 dexel grids.
+   */
+  private subtractSphere(cx: number, cy: number, cz: number, r: number): void {
+    const cs = this.resolution;
+
+    // Z-grid: for each (ix,iy), compute Z interval intersected by sphere
+    {
+      const ix0 = Math.max(0, Math.floor((cx - r - this.bbox.minX) / cs));
+      const ix1 = Math.min(this.nx - 1, Math.floor((cx + r - this.bbox.minX) / cs));
+      const iy0 = Math.max(0, Math.floor((cy - r - this.bbox.minY) / cs));
+      const iy1 = Math.min(this.ny - 1, Math.floor((cy + r - this.bbox.minY) / cs));
+      for (let iy = iy0; iy <= iy1; iy++) {
+        const cellY = this.bbox.minY + (iy + 0.5) * cs;
+        const dy = cellY - cy;
+        for (let ix = ix0; ix <= ix1; ix++) {
+          const cellX = this.bbox.minX + (ix + 0.5) * cs;
+          const dxx = cellX - cx;
+          const d2 = dxx * dxx + dy * dy;
+          if (d2 >= r * r) continue;
+          const hz = Math.sqrt(r * r - d2);
+          const ci = iy * this.nx + ix;
+          this.zGrid.segments[ci] = subtractInterval(
+            this.zGrid.segments[ci], cz - hz, cz + hz);
+        }
+      }
+    }
+    // X-grid
+    {
+      const iy0 = Math.max(0, Math.floor((cy - r - this.bbox.minY) / cs));
+      const iy1 = Math.min(this.ny - 1, Math.floor((cy + r - this.bbox.minY) / cs));
+      const iz0 = Math.max(0, Math.floor((cz - r - this.bbox.minZ) / cs));
+      const iz1 = Math.min(this.nz - 1, Math.floor((cz + r - this.bbox.minZ) / cs));
+      for (let iz = iz0; iz <= iz1; iz++) {
+        const cellZ = this.bbox.minZ + (iz + 0.5) * cs;
+        const dz = cellZ - cz;
+        for (let iy = iy0; iy <= iy1; iy++) {
+          const cellY = this.bbox.minY + (iy + 0.5) * cs;
+          const dy = cellY - cy;
+          const d2 = dy * dy + dz * dz;
+          if (d2 >= r * r) continue;
+          const hx = Math.sqrt(r * r - d2);
+          const ci = iz * this.ny + iy;
+          this.xGrid.segments[ci] = subtractInterval(
+            this.xGrid.segments[ci], cx - hx, cx + hx);
+        }
+      }
+    }
+    // Y-grid
+    {
+      const ix0 = Math.max(0, Math.floor((cx - r - this.bbox.minX) / cs));
+      const ix1 = Math.min(this.nx - 1, Math.floor((cx + r - this.bbox.minX) / cs));
+      const iz0 = Math.max(0, Math.floor((cz - r - this.bbox.minZ) / cs));
+      const iz1 = Math.min(this.nz - 1, Math.floor((cz + r - this.bbox.minZ) / cs));
+      for (let iz = iz0; iz <= iz1; iz++) {
+        const cellZ = this.bbox.minZ + (iz + 0.5) * cs;
+        const dz = cellZ - cz;
+        for (let ix = ix0; ix <= ix1; ix++) {
+          const cellX = this.bbox.minX + (ix + 0.5) * cs;
+          const dxx = cellX - cx;
+          const d2 = dxx * dxx + dz * dz;
+          if (d2 >= r * r) continue;
+          const hy = Math.sqrt(r * r - d2);
+          const ci = iz * this.nx + ix;
+          this.yGrid.segments[ci] = subtractInterval(
+            this.yGrid.segments[ci], cy - hy, cy + hy);
+        }
+      }
+    }
   }
 
   /**
@@ -507,6 +632,12 @@ function rayTriangleIntersectAxis(
  *   ball:      sqrt(R² - (R-h)²) for h < R, then R for h >= R
  *   bull_nose: depends on torus region
  */
+function toolRadiusAtHeightExported(
+  h: number, toolRadius: number, cornerRadius: number, fluteLength: number
+): number {
+  return toolRadiusAtHeight(h, toolRadius, cornerRadius, fluteLength);
+}
+
 function toolRadiusAtHeight(
   h: number,
   toolRadius: number,

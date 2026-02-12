@@ -8,6 +8,10 @@ export interface SimStepResult {
   toolId: string;
   done: boolean;
   progress: SimulationProgress;
+  // 5-axis tool orientation
+  toolAi?: number;
+  toolAj?: number;
+  toolAk?: number;
 }
 
 /**
@@ -20,6 +24,9 @@ export class SimulationRunner {
   private prevX = 0;
   private prevY = 0;
   private prevZ = 50;
+  private prevAi = 0;
+  private prevAj = 0;
+  private prevAk = 1;
   private totalPoints: number;
   private processedPoints = 0;
   private initialVolume: number;
@@ -46,6 +53,9 @@ export class SimulationRunner {
       this.prevX = p0.x;
       this.prevY = p0.y;
       this.prevZ = p0.z;
+      this.prevAi = p0.ai ?? 0;
+      this.prevAj = p0.aj ?? 0;
+      this.prevAk = p0.ak ?? 1;
     }
   }
 
@@ -76,18 +86,37 @@ export class SimulationRunner {
     const tool = this.tools.get(this.toolpath[this.segIdx].toolId);
 
     if (tool && point.type !== 'rapid') {
-      this.dexelModel.subtractToolLinear(
-        this.prevX, this.prevY, this.prevZ,
-        point.x, point.y, point.z,
-        tool.diameter / 2,
-        tool.cornerRadius,
-        tool.fluteLength
-      );
+      const is5axis = point.ai !== undefined;
+
+      if (is5axis) {
+        // 5-axis: use sphere decomposition
+        this.dexelModel.subtractToolLinear5Axis(
+          this.prevX, this.prevY, this.prevZ,
+          point.x, point.y, point.z,
+          this.prevAi, this.prevAj, this.prevAk,
+          point.ai!, point.aj!, point.ak!,
+          tool.diameter / 2,
+          tool.cornerRadius,
+          tool.fluteLength
+        );
+      } else {
+        // 3-axis: use existing fast method
+        this.dexelModel.subtractToolLinear(
+          this.prevX, this.prevY, this.prevZ,
+          point.x, point.y, point.z,
+          tool.diameter / 2,
+          tool.cornerRadius,
+          tool.fluteLength
+        );
+      }
     }
 
     this.prevX = point.x;
     this.prevY = point.y;
     this.prevZ = point.z;
+    this.prevAi = point.ai ?? 0;
+    this.prevAj = point.aj ?? 0;
+    this.prevAk = point.ak ?? 1;
     this.ptIdx++;
     this.processedPoints++;
 
@@ -104,6 +133,9 @@ export class SimulationRunner {
         ? this.toolpath[this.segIdx].toolId
         : '',
       done,
+      toolAi: this.prevAi,
+      toolAj: this.prevAj,
+      toolAk: this.prevAk,
       progress: {
         currentSegmentIndex: this.segIdx,
         currentPointIndex: this.ptIdx,
@@ -128,6 +160,9 @@ export class SimulationRunner {
       this.prevX = p0.x;
       this.prevY = p0.y;
       this.prevZ = p0.z;
+      this.prevAi = p0.ai ?? 0;
+      this.prevAj = p0.aj ?? 0;
+      this.prevAk = p0.ak ?? 1;
     }
   }
 

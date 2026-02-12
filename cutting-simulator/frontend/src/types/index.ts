@@ -21,6 +21,10 @@ export interface ToolpathPoint {
   z: number;
   feedRate: number;    // mm/min
   type: MotionType;
+  // 5-axis: tool axis direction vector (unit). Default (0,0,1) = vertical.
+  ai?: number; // tool axis X component
+  aj?: number; // tool axis Y component
+  ak?: number; // tool axis Z component
 }
 
 export interface ToolpathSegment {

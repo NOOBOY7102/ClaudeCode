@@ -5,9 +5,12 @@ interface GCodeState {
   x: number;
   y: number;
   z: number;
+  a: number; // A-axis (tilt around X, degrees)
+  b: number; // B-axis (tilt around Y, degrees)
   feedRate: number;
   currentTool: string;
   isAbsolute: boolean;
+  is5axis: boolean; // true once A or B word is seen
 }
 
 interface ParsedLine {
@@ -15,9 +18,21 @@ interface ParsedLine {
   comment?: string;
 }
 
+/** Convert A/B angles (degrees) to tool axis unit vector (i,j,k) */
+function abToAxisVector(aDeg: number, bDeg: number): [number, number, number] {
+  // A = rotation around X-axis, B = rotation around Y-axis
+  // Tool axis starts as (0,0,1) and is rotated by B then A
+  const ar = aDeg * Math.PI / 180;
+  const br = bDeg * Math.PI / 180;
+  const sinA = Math.sin(ar), cosA = Math.cos(ar);
+  const sinB = Math.sin(br), cosB = Math.cos(br);
+  // Rz after Ry(B) then Rx(A): (sinB, -sinA*cosB, cosA*cosB)
+  return [sinB, -sinA * cosB, cosA * cosB];
+}
+
 /**
  * Parse G-code text into toolpath segments.
- * Supports: G0, G1, G2, G3, G90, G91, T, M6, F, S
+ * Supports: G0, G1, G2, G3, G90, G91, T, M6, F, S, A, B (5-axis)
  */
 export function parseGCode(text: string, toolIds?: string[]): ToolpathSegment[] {
   const lines = text.split('\n');
@@ -26,9 +41,11 @@ export function parseGCode(text: string, toolIds?: string[]): ToolpathSegment[] 
   const state: GCodeState = {
     motionMode: 'rapid',
     x: 0, y: 0, z: 0,
+    a: 0, b: 0,
     feedRate: 1000,
     currentTool: toolIds?.[0] ?? 'T1',
     isAbsolute: true,
+    is5axis: false,
   };
 
   let currentPoints: ToolpathPoint[] = [];
@@ -80,8 +97,19 @@ export function parseGCode(text: string, toolIds?: string[]): ToolpathSegment[] 
       state.feedRate = words.get('F')!;
     }
 
+    // A/B axis (5-axis)
+    if (words.has('A')) {
+      state.a = state.isAbsolute ? words.get('A')! : state.a + words.get('A')!;
+      state.is5axis = true;
+    }
+    if (words.has('B')) {
+      state.b = state.isAbsolute ? words.get('B')! : state.b + words.get('B')!;
+      state.is5axis = true;
+    }
+
     // Motion
-    if (words.has('X') || words.has('Y') || words.has('Z')) {
+    if (words.has('X') || words.has('Y') || words.has('Z') ||
+        words.has('A') || words.has('B')) {
       let nx = state.x, ny = state.y, nz = state.z;
 
       if (state.isAbsolute) {
@@ -103,15 +131,22 @@ export function parseGCode(text: string, toolIds?: string[]): ToolpathSegment[] 
           words.get('J') ?? 0,
           words.get('K') ?? 0,
           state.motionMode === 'arc_cw',
-          state.feedRate
+          state.feedRate,
+          state.is5axis ? state.a : undefined,
+          state.is5axis ? state.b : undefined
         );
         currentPoints.push(...arcPoints);
       } else {
-        currentPoints.push({
+        const pt: ToolpathPoint = {
           x: nx, y: ny, z: nz,
           feedRate: state.motionMode === 'rapid' ? 10000 : state.feedRate,
           type: state.motionMode,
-        });
+        };
+        if (state.is5axis) {
+          const [ai, aj, ak] = abToAxisVector(state.a, state.b);
+          pt.ai = ai; pt.aj = aj; pt.ak = ak;
+        }
+        currentPoints.push(pt);
       }
 
       state.x = nx;
@@ -150,7 +185,6 @@ function parseLine(line: string): ParsedLine | null {
   while ((match = regex.exec(clean)) !== null) {
     const letter = match[1].toUpperCase();
     const value = parseFloat(match[2]);
-    // For G codes, we process the last one per line
     words.set(letter, value);
   }
 
@@ -164,7 +198,9 @@ function interpolateArc(
   x1: number, y1: number, z1: number,
   i: number, j: number, _k: number,
   clockwise: boolean,
-  feedRate: number
+  feedRate: number,
+  aDeg?: number,
+  bDeg?: number
 ): ToolpathPoint[] {
   const cx = x0 + i;
   const cy = y0 + j;
@@ -183,18 +219,28 @@ function interpolateArc(
   const steps = Math.max(8, Math.ceil(totalAngle / (Math.PI / 18))); // 10° per step
   const points: ToolpathPoint[] = [];
 
+  const has5axis = aDeg !== undefined && bDeg !== undefined;
+  let ai: number | undefined, aj: number | undefined, ak: number | undefined;
+  if (has5axis) {
+    [ai, aj, ak] = abToAxisVector(aDeg!, bDeg!);
+  }
+
   for (let s = 1; s <= steps; s++) {
     const t = s / steps;
     const angle = startAngle + (endAngle - startAngle) * t;
     const z = z0 + (z1 - z0) * t;
 
-    points.push({
+    const pt: ToolpathPoint = {
       x: cx + r * Math.cos(angle),
       y: cy + r * Math.sin(angle),
       z,
       feedRate,
       type: clockwise ? 'arc_cw' : 'arc_ccw',
-    });
+    };
+    if (has5axis) {
+      pt.ai = ai; pt.aj = aj; pt.ak = ak;
+    }
+    points.push(pt);
   }
 
   return points;
@@ -210,7 +256,7 @@ export function generateDemoGCode(
   stockTopZ: number,
   depth: number,
   toolDiameter: number,
-  stepover: number, // fraction of tool diameter
+  stepover: number,
   layers: number
 ): string {
   const lines: string[] = [
@@ -242,22 +288,6 @@ export function generateDemoGCode(
 
       forward = !forward;
     }
-  }
-
-  // Finishing pass - contour around a dome/pocket shape
-  lines.push('(Finishing pass - circular pocket)');
-  const cx = (stockMinX + stockMaxX) / 2;
-  const cy = (stockMinY + stockMaxY) / 2;
-  const maxR = Math.min(stockMaxX - stockMinX, stockMaxY - stockMinY) * 0.35;
-  const finishZ = stockTopZ - depth;
-  const finishStep = toolDiameter * 0.1; // 10% stepover for finishing
-
-  for (let r = finishStep; r <= maxR; r += finishStep) {
-    lines.push(`G0 X${(cx + r).toFixed(3)} Y${cy.toFixed(3)}`);
-    lines.push(`G1 Z${finishZ.toFixed(3)} F200`);
-    // Full circle with arc
-    lines.push(`G2 X${(cx + r).toFixed(3)} Y${cy.toFixed(3)} I${(-r).toFixed(3)} J0 F800`);
-    lines.push(`G0 Z${safeZ.toFixed(3)}`);
   }
 
   lines.push('G0 Z20');

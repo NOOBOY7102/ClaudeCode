@@ -22,6 +22,7 @@ interface AppState {
   runner: SimulationRunner | null;
   stepsPerFrame: number;
   toolPosition: { x: number; y: number; z: number } | null;
+  toolAxis: { ai: number; aj: number; ak: number } | null;
   currentToolId: string;
   progressPercent: number;
 
@@ -62,6 +63,7 @@ export const useStore = create<AppState>((set, get) => ({
   runner: null,
   stepsPerFrame: 8,
   toolPosition: null,
+  toolAxis: null,
   currentToolId: 'T1',
   progressPercent: 0,
   colorMode: 'solid',
@@ -106,6 +108,7 @@ export const useStore = create<AppState>((set, get) => ({
       stockMesh: mesh,
       progressPercent: 0,
       toolPosition: null,
+      toolAxis: null,
     });
   },
 
@@ -137,6 +140,7 @@ export const useStore = create<AppState>((set, get) => ({
       stockMesh: mesh,
       progressPercent: 0,
       toolPosition: null,
+      toolAxis: null,
     });
   },
 
@@ -167,6 +171,7 @@ export const useStore = create<AppState>((set, get) => ({
       stockMesh: mesh,
       progressPercent: 0,
       toolPosition: null,
+      toolAxis: null,
     });
   },
 
@@ -180,6 +185,9 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       stockMesh: mesh,
       toolPosition: { x: result.toolX, y: result.toolY, z: result.toolZ },
+      toolAxis: result.toolAi != null
+        ? { ai: result.toolAi, aj: result.toolAj!, ak: result.toolAk! }
+        : null,
       currentToolId: result.toolId,
       progressPercent: result.progress.materialRemoved,
       simState: result.done ? 'finished' : state.simState,
@@ -227,6 +235,9 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       stockMesh: mesh,
       toolPosition: { x: result.toolX, y: result.toolY, z: result.toolZ },
+      toolAxis: result.toolAi != null
+        ? { ai: result.toolAi, aj: result.toolAj!, ak: result.toolAk! }
+        : null,
       currentToolId: result.toolId,
       progressPercent: result.progress.materialRemoved,
       simState: result.done ? 'finished' : 'playing',
