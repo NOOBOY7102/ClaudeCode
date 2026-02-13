@@ -34,7 +34,7 @@ export const defaultTools: ToolDefinition[] = [
   },
 ];
 
-// === Default Stock (cylindrical impeller blank, approximated as box) ===
+// === Default Stock ===
 export const defaultStock: BBox = {
   minX: -35,
   maxX: 35,
@@ -45,21 +45,7 @@ export const defaultStock: BBox = {
 };
 
 // =====================================================================
-//  Impeller 5-axis Machining Demo
-//
-//  Target shape:
-//    - Central hub: cylinder R=8, Z=-3 to Z=22
-//    - 5 twisted blades radiating outward, height ~20mm
-//    - Blade channels (pockets between blades) are the cut areas
-//    - Hub top: dome shape
-//
-//  Machining strategy:
-//    Phase 1: Roughing (3-axis) — T1 φ10 Flat
-//      Layer-by-layer zigzag clearing channels, AVOIDING blades and hub
-//    Phase 2: Semi-finish (3+2 axis) — T3 φ8 R1 Bull Nose
-//      Contour passes on hub and blade root fillets
-//    Phase 3: Finishing (simultaneous 5-axis) — T2 φ6 Ball
-//      Tool tilts along blade surfaces, following curvature
+//  Impeller target shape definition
 // =====================================================================
 
 const NUM_BLADES = 5;
@@ -67,9 +53,11 @@ const HUB_R = 8;
 const BLADE_OUTER_R = 30;
 const BLADE_THICKNESS = 2.5;
 const BLADE_HEIGHT = 20; // Z=0 to Z=20
-const BLADE_TWIST = 35;  // degrees twist from root to tip
+const BLADE_TWIST = 25;  // degrees twist from root to tip
+const FLOOR_Z = -3;      // channel floor between blades
+const HUB_DOME_HEIGHT = 3; // dome rises 3mm above blade top
 
-/** Get blade center angle at given radius and Z height (twisted blade) */
+/** Blade center angle at given radius and Z height (twisted blade) */
 function bladeAngle(bladeIdx: number, r: number, z: number): number {
   const baseAngle = (bladeIdx / NUM_BLADES) * 2 * Math.PI;
   const twistRad = (BLADE_TWIST * Math.PI / 180);
@@ -80,6 +68,7 @@ function bladeAngle(bladeIdx: number, r: number, z: number): number {
 
 /** Check if point (x,y) at height z is inside any blade */
 function isInsideBlade(x: number, y: number, z: number): boolean {
+  if (z < 0 || z > BLADE_HEIGHT) return false;
   const r = Math.sqrt(x * x + y * y);
   if (r < HUB_R || r > BLADE_OUTER_R) return false;
   const pointAngle = Math.atan2(y, x);
@@ -95,152 +84,161 @@ function isInsideBlade(x: number, y: number, z: number): boolean {
   return false;
 }
 
-/**
- * Check if point (x,y,z) is within `clearance` distance of any blade.
- * Used for roughing tool path avoidance: clearance = toolRadius + stockAllowance.
- */
-function isNearBlade(x: number, y: number, z: number, clearance: number): boolean {
-  // Blades only exist between Z=0 and Z=BLADE_HEIGHT
-  if (z < -1 || z > BLADE_HEIGHT + 1) return false;
+// =====================================================================
+//  Target shape as a height map
+//
+//  targetTopZ(x, y) returns the maximum Z height of part material
+//  at position (x,y). This defines the finished impeller shape:
+//    - Hub dome: Z = 20 + dome
+//    - Blade cells: Z = max Z where blade exists at (x,y)
+//    - Channel cells: Z = FLOOR_Z (between blades)
+//    - Outside impeller: Z = stock bottom
+// =====================================================================
+
+function targetTopZ(x: number, y: number): number {
   const r = Math.sqrt(x * x + y * y);
-  if (r < HUB_R - 1 || r > BLADE_OUTER_R + clearance) return false;
-  const pointAngle = Math.atan2(y, x);
-  const zClamped = Math.max(0, Math.min(z, BLADE_HEIGHT));
 
-  for (let b = 0; b < NUM_BLADES; b++) {
-    const ba = bladeAngle(b, r, zClamped);
-    let diff = pointAngle - ba;
-    while (diff > Math.PI) diff -= 2 * Math.PI;
-    while (diff < -Math.PI) diff += 2 * Math.PI;
-    // Effective half-width: blade half-thickness + clearance (in angular terms)
-    const halfW = (BLADE_THICKNESS / 2 + clearance) / Math.max(r, 1);
-    if (Math.abs(diff) < halfW) return true;
+  // Outside impeller → stock bottom (will be cut away)
+  if (r > BLADE_OUTER_R + 0.5) return defaultStock.minZ;
+
+  // Inside hub → dome
+  if (r <= HUB_R) {
+    const rFrac = r / HUB_R;
+    return BLADE_HEIGHT + HUB_DOME_HEIGHT * Math.sqrt(Math.max(0, 1 - rFrac * rFrac));
   }
-  return false;
+
+  // Between hub and outer radius: search for blade at (x,y)
+  // Find the highest Z where the blade exists
+  for (let z = BLADE_HEIGHT; z >= 0; z -= 0.5) {
+    if (isInsideBlade(x, y, z)) {
+      return z;
+    }
+  }
+
+  // In channel between blades → floor
+  return FLOOR_Z;
 }
 
-/**
- * Find safe X-axis cutting segments for a given Y line at height Z.
- * Returns array of [xStart, xEnd] pairs that avoid blades and hub.
- */
-function findSafeXSegments(
-  y: number, z: number, xLim: number,
-  toolR: number, bladeClr: number, hubClr: number
-): [number, number][] {
-  const segments: [number, number][] = [];
-  const step = 0.5;
-  let segStart: number | null = null;
-  const n = Math.ceil(2 * xLim / step);
+// =====================================================================
+//  Height map computation and dilation (tool radius compensation)
+// =====================================================================
 
-  for (let i = 0; i <= n; i++) {
-    const x = -xLim + i * step;
-    const r = Math.sqrt(x * x + y * y);
-    const safe = r > hubClr && r < xLim && !isNearBlade(x, y, z, bladeClr);
+const MAP_CS = 0.5;  // cell size (matches dexel resolution)
+const MAP_NX = Math.ceil((defaultStock.maxX - defaultStock.minX) / MAP_CS);
+const MAP_NY = Math.ceil((defaultStock.maxY - defaultStock.minY) / MAP_CS);
+const MAP_OX = defaultStock.minX;
+const MAP_OY = defaultStock.minY;
 
-    if (safe && segStart === null) {
-      segStart = x;
-    } else if (!safe && segStart !== null) {
-      const end = -xLim + (i - 1) * step;
-      if (end - segStart >= toolR) {
-        segments.push([segStart, end]);
+function buildTargetMap(): Float32Array {
+  const map = new Float32Array(MAP_NX * MAP_NY);
+  for (let iy = 0; iy < MAP_NY; iy++) {
+    for (let ix = 0; ix < MAP_NX; ix++) {
+      const x = MAP_OX + (ix + 0.5) * MAP_CS;
+      const y = MAP_OY + (iy + 0.5) * MAP_CS;
+      map[iy * MAP_NX + ix] = targetTopZ(x, y);
+    }
+  }
+  return map;
+}
+
+/** Morphological dilation: each cell gets the max of its neighborhood */
+function dilateMap(map: Float32Array, radius: number): Float32Array {
+  const dilated = new Float32Array(MAP_NX * MAP_NY);
+  const cells = Math.ceil(radius / MAP_CS);
+  const r2 = cells * cells;
+
+  for (let iy = 0; iy < MAP_NY; iy++) {
+    for (let ix = 0; ix < MAP_NX; ix++) {
+      let maxZ = -100;
+      for (let dy = -cells; dy <= cells; dy++) {
+        for (let dx = -cells; dx <= cells; dx++) {
+          if (dx * dx + dy * dy > r2) continue;
+          const jx = ix + dx;
+          const jy = iy + dy;
+          if (jx >= 0 && jx < MAP_NX && jy >= 0 && jy < MAP_NY) {
+            const v = map[jy * MAP_NX + jx];
+            if (v > maxZ) maxZ = v;
+          }
+        }
       }
-      segStart = null;
+      dilated[iy * MAP_NX + ix] = maxZ;
     }
   }
-  if (segStart !== null) {
-    if (xLim - segStart >= toolR) {
-      segments.push([segStart, xLim]);
-    }
-  }
-  return segments;
+  return dilated;
 }
+
+/** Look up dilated target Z at world coordinates */
+function lookupZ(map: Float32Array, x: number, y: number): number {
+  const ix = Math.floor((x - MAP_OX) / MAP_CS);
+  const iy = Math.floor((y - MAP_OY) / MAP_CS);
+  if (ix < 0 || ix >= MAP_NX || iy < 0 || iy >= MAP_NY) return -100;
+  return map[iy * MAP_NX + ix];
+}
+
+// =====================================================================
+//  G-code generation: toolpaths from stock → target shape
+// =====================================================================
 
 export function getDefaultGCode(): string {
+  // Precompute target height maps with tool radius compensation
+  const rawMap = buildTargetMap();
+
+  const TR1 = 5;  // T1 tool radius
+  const TR3 = 4;  // T3 tool radius
+  const ROUGH_ALLOW = 0.5;  // finishing stock allowance
+  const SEMI_ALLOW = 0.2;
+
+  const roughMap = dilateMap(rawMap, TR1 + ROUGH_ALLOW);
+  const semiMap = dilateMap(rawMap, TR3 + SEMI_ALLOW);
+
   const L: string[] = [];
   const SZ = 30;
 
   L.push('(=== Impeller 5-Axis Machining Demo ===)');
-  L.push('(5 blades, twisted, simultaneous 5-axis finishing)');
+  L.push('(Target-shape-based toolpath generation)');
   L.push('G90 G21');
   L.push('');
 
   // ==========================================================
   //  Phase 1: ROUGHING — T1 φ10 Flat End Mill (3-axis)
-  //  Zigzag with blade avoidance: breaks each line into segments
-  //  that skip blade+hub regions
+  //  Cut where dilated target height < current Z layer
   // ==========================================================
   L.push('(===== Phase 1: Roughing - T1 Flat φ10 =====)');
   L.push('T1 M6');
   L.push('M3 S10000');
   L.push(`G0 Z${SZ}`);
 
-  const TR1 = 5; // tool radius
-  const STEP1 = 5; // zigzag line spacing
-  const BLADE_CLR_ROUGH = TR1 + 1; // blade clearance = tool radius + stock allowance
-  const HUB_CLR = HUB_R + TR1 + 1.5; // hub clearance
+  const STEP1 = 5;  // zigzag line spacing
+  const MIN_SEG = 3; // minimum segment length to cut
 
-  // --- Upper layers: above blade region (Z > BLADE_HEIGHT) ---
-  // No blade avoidance needed here, just avoid hub
-  for (const cz of [24, 22, 20]) {
+  // Layer-by-layer from top down
+  const roughLayers = [24, 22, 20, 17, 14, 11, 8, 5, 2, 0, -2];
+
+  for (const cz of roughLayers) {
     L.push(`(-- Rough layer Z=${cz} --)`);
     let fwd = true;
+
     for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
-      const xMax = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
-      if (xMax < TR1) continue;
+      const xLim = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y));
+      if (xLim < TR1) continue;
 
-      if (y * y < HUB_CLR * HUB_CLR) {
-        const xHub = Math.sqrt(Math.max(0, HUB_CLR * HUB_CLR - y * y));
-        if (xHub < xMax - TR1) {
-          lineCut(L, fwd ? -xMax : -xHub, y, cz, fwd ? -xHub : -xMax, y, cz, SZ);
-          lineCut(L, fwd ? xHub : xMax, y, cz, fwd ? xMax : xHub, y, cz, SZ);
-        }
-      } else {
-        lineCut(L, fwd ? -xMax : xMax, y, cz, fwd ? xMax : -xMax, y, cz, SZ);
-      }
-      fwd = !fwd;
-    }
-  }
+      // Scan X to find segments where target is below current Z
+      const segs = findCuttableSegments(roughMap, y, cz, -xLim, xLim, MIN_SEG);
 
-  // --- Blade region layers: Z=18 down to Z=0, with blade avoidance ---
-  for (const cz of [18, 15, 12, 9, 6, 3, 0]) {
-    L.push(`(-- Rough layer Z=${cz} blade region --)`);
-    let fwd = true;
-    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
-      const xLim = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
-      if (xLim < 2) continue;
-
-      const segs = findSafeXSegments(y, cz, xLim, TR1, BLADE_CLR_ROUGH, HUB_CLR);
       for (const [sx, ex] of segs) {
-        lineCut(L, fwd ? sx : ex, y, cz, fwd ? ex : sx, y, cz, SZ);
-      }
-      fwd = !fwd;
-    }
-  }
-
-  // --- Floor layers: below blade region (Z < 0) ---
-  // No blade avoidance needed, just hub avoidance
-  for (const cz of [-2, -4]) {
-    L.push(`(-- Rough floor Z=${cz} --)`);
-    let fwd = true;
-    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
-      const xMax = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
-      if (xMax < TR1) continue;
-
-      if (y * y < HUB_CLR * HUB_CLR) {
-        const xHub = Math.sqrt(Math.max(0, HUB_CLR * HUB_CLR - y * y));
-        if (xHub < xMax - TR1) {
-          lineCut(L, fwd ? -xMax : -xHub, y, cz, fwd ? -xHub : -xMax, y, cz, SZ);
-          lineCut(L, fwd ? xHub : xMax, y, cz, fwd ? xMax : xHub, y, cz, SZ);
+        if (fwd) {
+          lineCut(L, sx, y, cz, ex, y, cz, SZ);
+        } else {
+          lineCut(L, ex, y, cz, sx, y, cz, SZ);
         }
-      } else {
-        lineCut(L, fwd ? -xMax : xMax, y, cz, fwd ? xMax : -xMax, y, cz, SZ);
       }
       fwd = !fwd;
     }
   }
 
   // ==========================================================
-  //  Phase 2: SEMI-FINISH — T3 φ8 R1 Bull Nose (3-axis contour)
+  //  Phase 2: SEMI-FINISH — T3 φ8 R1 Bull Nose (3-axis)
+  //  Finer passes using semi-finish dilated map
   // ==========================================================
   L.push('');
   L.push('(===== Phase 2: Semi-finish - T3 Bull Nose φ8 R1 =====)');
@@ -248,51 +246,39 @@ export function getDefaultGCode(): string {
   L.push('M3 S14000');
   L.push(`G0 Z${SZ}`);
 
-  // Hub contour at multiple Z levels
+  // Hub contour
   L.push('(-- Hub contour --)');
   for (let z = 20; z >= 0; z -= 2) {
     circle(L, HUB_R + 1, z, SZ, 200, 800);
   }
 
-  // Hub top dome (concentric circles)
-  L.push('(-- Hub top --)');
+  // Hub dome
+  L.push('(-- Hub dome --)');
   for (let r = 2; r <= HUB_R; r += 1.5) {
-    const domeZ = 20 + 3 * Math.sqrt(1 - (r / HUB_R) * (r / HUB_R));
+    const domeZ = BLADE_HEIGHT + HUB_DOME_HEIGHT * Math.sqrt(Math.max(0, 1 - (r / HUB_R) ** 2));
     circle(L, r, domeZ, SZ, 150, 800);
   }
 
-  // Channel floor cleanup (concentric arcs between blades)
-  L.push('(-- Channel floor cleanup --)');
-  const TR3 = 4; // T3 tool radius
-  const BLADE_CLR_SEMI = TR3 + 0.5;
-  for (let z = 0; z >= -3; z -= 1.5) {
-    for (let r = HUB_R + 5; r <= BLADE_OUTER_R - 2; r += 3) {
-      // Generate arc segments that avoid blades
-      const nSteps = Math.max(36, Math.ceil(2 * Math.PI * r / 2));
-      let cutting = false;
-      for (let s = 0; s <= nSteps; s++) {
-        const angle = (s / nSteps) * 2 * Math.PI;
-        const px = r * Math.cos(angle);
-        const py = r * Math.sin(angle);
+  // Channel cleanup using semi-finish map (finer zigzag)
+  L.push('(-- Channel cleanup --)');
+  const STEP3 = 3;
+  const semiLayers = [18, 14, 10, 6, 2, -1, -3];
 
-        if (!isNearBlade(px, py, z, BLADE_CLR_SEMI)) {
-          if (!cutting) {
-            L.push(`G0 X${px.toFixed(2)} Y${py.toFixed(2)}`);
-            L.push(`G1 Z${z.toFixed(1)} F200`);
-            cutting = true;
-          } else {
-            L.push(`G1 X${px.toFixed(2)} Y${py.toFixed(2)} F1000`);
-          }
+  for (const cz of semiLayers) {
+    let fwd = true;
+    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP3) {
+      const xLim = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y));
+      if (xLim < TR3) continue;
+
+      const segs = findCuttableSegments(semiMap, y, cz, -xLim, xLim, 2);
+      for (const [sx, ex] of segs) {
+        if (fwd) {
+          lineCut(L, sx, y, cz, ex, y, cz, SZ, 200, 1000);
         } else {
-          if (cutting) {
-            L.push(`G0 Z${SZ}`);
-            cutting = false;
-          }
+          lineCut(L, ex, y, cz, sx, y, cz, SZ, 200, 1000);
         }
       }
-      if (cutting) {
-        L.push(`G0 Z${SZ}`);
-      }
+      fwd = !fwd;
     }
   }
 
@@ -305,7 +291,7 @@ export function getDefaultGCode(): string {
   L.push('M3 S18000');
   L.push(`G0 Z${SZ}`);
 
-  // For each blade, generate 5-axis toolpath along both sides
+  // Blade surface finishing (both sides of each blade)
   const FINISH_STEP_Z = 1.5;
   const FINISH_STEP_R = 1.0;
 
@@ -323,14 +309,13 @@ export function getDefaultGCode(): string {
 
           const tx = r * Math.cos(surfAngle);
           const ty = r * Math.sin(surfAngle);
-          const tz = z;
 
           const tiltAngle = side * 15;
           const bladeNormalAngle = surfAngle + side * Math.PI / 2;
           const aAx = tiltAngle * Math.cos(bladeNormalAngle);
           const bAx = tiltAngle * Math.sin(bladeNormalAngle);
 
-          pts.push({ x: tx, y: ty, z: tz, a: aAx, b: bAx });
+          pts.push({ x: tx, y: ty, z: z, a: aAx, b: bAx });
         }
 
         if (pts.length < 2) continue;
@@ -343,16 +328,15 @@ export function getDefaultGCode(): string {
           const p = pts[i];
           L.push(`G1 X${p.x.toFixed(2)} Y${p.y.toFixed(2)} Z${p.z.toFixed(2)} A${p.a.toFixed(2)} B${p.b.toFixed(2)} F500`);
         }
-
         L.push(`G0 Z${SZ}`);
       }
     }
   }
 
-  // Hub dome finishing (5-axis, tool normal to dome surface)
+  // Hub dome 5-axis finishing
   L.push('(-- Hub dome 5-axis finishing --)');
   for (let r = 1; r <= HUB_R - 0.5; r += 0.8) {
-    const domeZ = 20 + 3 * Math.sqrt(Math.max(0, 1 - (r / HUB_R) * (r / HUB_R)));
+    const domeZ = BLADE_HEIGHT + HUB_DOME_HEIGHT * Math.sqrt(Math.max(0, 1 - (r / HUB_R) ** 2));
     const tiltDeg = (r / HUB_R) * 25;
     const nSteps = Math.max(16, Math.ceil(2 * Math.PI * r / 1.0));
 
@@ -381,7 +365,48 @@ export function getDefaultGCode(): string {
   return L.join('\n');
 }
 
-// =============== G-code helpers ===============
+// =====================================================================
+//  Toolpath helpers
+// =====================================================================
+
+/**
+ * Find X-axis segments where dilated target Z < cutting Z.
+ * Returns [xStart, xEnd] pairs suitable for cutting.
+ */
+function findCuttableSegments(
+  dilatedMap: Float32Array,
+  y: number, cz: number,
+  xMin: number, xMax: number,
+  minLength: number
+): [number, number][] {
+  const segments: [number, number][] = [];
+  const step = 0.5;
+  let segStart: number | null = null;
+  const n = Math.ceil((xMax - xMin) / step);
+
+  for (let i = 0; i <= n; i++) {
+    const x = xMin + i * step;
+    const targetZ = lookupZ(dilatedMap, x, y);
+    const canCut = targetZ < cz - 0.1;  // target is below current Z → cut
+
+    if (canCut && segStart === null) {
+      segStart = x;
+    } else if (!canCut && segStart !== null) {
+      const end = xMin + (i - 1) * step;
+      if (end - segStart >= minLength) {
+        segments.push([segStart, end]);
+      }
+      segStart = null;
+    }
+  }
+  if (segStart !== null) {
+    const end = xMin + n * step;
+    if (end - segStart >= minLength) {
+      segments.push([segStart, end]);
+    }
+  }
+  return segments;
+}
 
 function lineCut(
   L: string[],
@@ -411,7 +436,14 @@ function circle(
 }
 
 /**
- * Generate vertices for a simple dome target shape (for difference comparison)
+ * Export target height function for potential visualization / difference map
+ */
+export function getTargetTopZ(x: number, y: number): number {
+  return targetTopZ(x, y);
+}
+
+/**
+ * Generate vertices for dome target shape (for difference comparison)
  */
 export function getDomeTargetHeight(
   cx: number, cy: number, radius: number,
