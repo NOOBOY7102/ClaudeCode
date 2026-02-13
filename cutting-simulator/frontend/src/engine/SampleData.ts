@@ -55,7 +55,7 @@ export const defaultStock: BBox = {
 //
 //  Machining strategy:
 //    Phase 1: Roughing (3-axis) — T1 φ10 Flat
-//      Layer-by-layer zigzag clearing channels, avoiding hub
+//      Layer-by-layer zigzag clearing channels, AVOIDING blades and hub
 //    Phase 2: Semi-finish (3+2 axis) — T3 φ8 R1 Bull Nose
 //      Contour passes on hub and blade root fillets
 //    Phase 3: Finishing (simultaneous 5-axis) — T2 φ6 Ball
@@ -72,10 +72,9 @@ const BLADE_TWIST = 35;  // degrees twist from root to tip
 /** Get blade center angle at given radius and Z height (twisted blade) */
 function bladeAngle(bladeIdx: number, r: number, z: number): number {
   const baseAngle = (bladeIdx / NUM_BLADES) * 2 * Math.PI;
-  // Twist: increases with Z and radius
   const twistRad = (BLADE_TWIST * Math.PI / 180);
-  const rFrac = (r - HUB_R) / (BLADE_OUTER_R - HUB_R);
-  const zFrac = Math.max(0, z) / BLADE_HEIGHT;
+  const rFrac = Math.max(0, (r - HUB_R) / (BLADE_OUTER_R - HUB_R));
+  const zFrac = Math.max(0, Math.min(z, BLADE_HEIGHT)) / BLADE_HEIGHT;
   return baseAngle + twistRad * rFrac * zFrac;
 }
 
@@ -88,14 +87,72 @@ function isInsideBlade(x: number, y: number, z: number): boolean {
   for (let b = 0; b < NUM_BLADES; b++) {
     const ba = bladeAngle(b, r, z);
     let diff = pointAngle - ba;
-    // Normalize to [-PI, PI]
     while (diff > Math.PI) diff -= 2 * Math.PI;
     while (diff < -Math.PI) diff += 2 * Math.PI;
-    // Blade half-width in angular terms
     const halfW = BLADE_THICKNESS / (2 * r);
     if (Math.abs(diff) < halfW) return true;
   }
   return false;
+}
+
+/**
+ * Check if point (x,y,z) is within `clearance` distance of any blade.
+ * Used for roughing tool path avoidance: clearance = toolRadius + stockAllowance.
+ */
+function isNearBlade(x: number, y: number, z: number, clearance: number): boolean {
+  // Blades only exist between Z=0 and Z=BLADE_HEIGHT
+  if (z < -1 || z > BLADE_HEIGHT + 1) return false;
+  const r = Math.sqrt(x * x + y * y);
+  if (r < HUB_R - 1 || r > BLADE_OUTER_R + clearance) return false;
+  const pointAngle = Math.atan2(y, x);
+  const zClamped = Math.max(0, Math.min(z, BLADE_HEIGHT));
+
+  for (let b = 0; b < NUM_BLADES; b++) {
+    const ba = bladeAngle(b, r, zClamped);
+    let diff = pointAngle - ba;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    // Effective half-width: blade half-thickness + clearance (in angular terms)
+    const halfW = (BLADE_THICKNESS / 2 + clearance) / Math.max(r, 1);
+    if (Math.abs(diff) < halfW) return true;
+  }
+  return false;
+}
+
+/**
+ * Find safe X-axis cutting segments for a given Y line at height Z.
+ * Returns array of [xStart, xEnd] pairs that avoid blades and hub.
+ */
+function findSafeXSegments(
+  y: number, z: number, xLim: number,
+  toolR: number, bladeClr: number, hubClr: number
+): [number, number][] {
+  const segments: [number, number][] = [];
+  const step = 0.5;
+  let segStart: number | null = null;
+  const n = Math.ceil(2 * xLim / step);
+
+  for (let i = 0; i <= n; i++) {
+    const x = -xLim + i * step;
+    const r = Math.sqrt(x * x + y * y);
+    const safe = r > hubClr && r < xLim && !isNearBlade(x, y, z, bladeClr);
+
+    if (safe && segStart === null) {
+      segStart = x;
+    } else if (!safe && segStart !== null) {
+      const end = -xLim + (i - 1) * step;
+      if (end - segStart >= toolR) {
+        segments.push([segStart, end]);
+      }
+      segStart = null;
+    }
+  }
+  if (segStart !== null) {
+    if (xLim - segStart >= toolR) {
+      segments.push([segStart, xLim]);
+    }
+  }
+  return segments;
 }
 
 export function getDefaultGCode(): string {
@@ -109,37 +166,70 @@ export function getDefaultGCode(): string {
 
   // ==========================================================
   //  Phase 1: ROUGHING — T1 φ10 Flat End Mill (3-axis)
+  //  Zigzag with blade avoidance: breaks each line into segments
+  //  that skip blade+hub regions
   // ==========================================================
   L.push('(===== Phase 1: Roughing - T1 Flat φ10 =====)');
   L.push('T1 M6');
   L.push('M3 S10000');
   L.push(`G0 Z${SZ}`);
 
-  const TR1 = 5;
-  const STEP1 = 6;
+  const TR1 = 5; // tool radius
+  const STEP1 = 5; // zigzag line spacing
+  const BLADE_CLR_ROUGH = TR1 + 1; // blade clearance = tool radius + stock allowance
+  const HUB_CLR = HUB_R + TR1 + 1.5; // hub clearance
 
-  // Layer-by-layer zigzag, clearing everything outside hub, keeping blades
-  // But blades are thin — roughing doesn't avoid blades individually
-  // Instead: rough entire channel area, leave material around blades for finishing
-  const roughLayers = [20, 16, 12, 8, 4, 0];
-  const hubAvoid = HUB_R + TR1 + 2; // avoid hub with clearance
-
-  for (const cz of roughLayers) {
+  // --- Upper layers: above blade region (Z > BLADE_HEIGHT) ---
+  // No blade avoidance needed here, just avoid hub
+  for (const cz of [24, 22, 20]) {
     L.push(`(-- Rough layer Z=${cz} --)`);
     let fwd = true;
-    for (let y = -BLADE_OUTER_R; y <= BLADE_OUTER_R; y += STEP1) {
-      const xMax = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y));
-      if (xMax < TR1 + 1) continue;
+    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
+      const xMax = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
+      if (xMax < TR1) continue;
 
-      if (y * y < hubAvoid * hubAvoid) {
-        // Split around hub
-        const xHub = Math.sqrt(Math.max(0, hubAvoid * hubAvoid - y * y));
-        // Left segment
+      if (y * y < HUB_CLR * HUB_CLR) {
+        const xHub = Math.sqrt(Math.max(0, HUB_CLR * HUB_CLR - y * y));
         if (xHub < xMax - TR1) {
           lineCut(L, fwd ? -xMax : -xHub, y, cz, fwd ? -xHub : -xMax, y, cz, SZ);
+          lineCut(L, fwd ? xHub : xMax, y, cz, fwd ? xMax : xHub, y, cz, SZ);
         }
-        // Right segment
+      } else {
+        lineCut(L, fwd ? -xMax : xMax, y, cz, fwd ? xMax : -xMax, y, cz, SZ);
+      }
+      fwd = !fwd;
+    }
+  }
+
+  // --- Blade region layers: Z=18 down to Z=0, with blade avoidance ---
+  for (const cz of [18, 15, 12, 9, 6, 3, 0]) {
+    L.push(`(-- Rough layer Z=${cz} blade region --)`);
+    let fwd = true;
+    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
+      const xLim = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
+      if (xLim < 2) continue;
+
+      const segs = findSafeXSegments(y, cz, xLim, TR1, BLADE_CLR_ROUGH, HUB_CLR);
+      for (const [sx, ex] of segs) {
+        lineCut(L, fwd ? sx : ex, y, cz, fwd ? ex : sx, y, cz, SZ);
+      }
+      fwd = !fwd;
+    }
+  }
+
+  // --- Floor layers: below blade region (Z < 0) ---
+  // No blade avoidance needed, just hub avoidance
+  for (const cz of [-2, -4]) {
+    L.push(`(-- Rough floor Z=${cz} --)`);
+    let fwd = true;
+    for (let y = -BLADE_OUTER_R + 1; y <= BLADE_OUTER_R - 1; y += STEP1) {
+      const xMax = Math.sqrt(Math.max(0, BLADE_OUTER_R * BLADE_OUTER_R - y * y)) - 1;
+      if (xMax < TR1) continue;
+
+      if (y * y < HUB_CLR * HUB_CLR) {
+        const xHub = Math.sqrt(Math.max(0, HUB_CLR * HUB_CLR - y * y));
         if (xHub < xMax - TR1) {
+          lineCut(L, fwd ? -xMax : -xHub, y, cz, fwd ? -xHub : -xMax, y, cz, SZ);
           lineCut(L, fwd ? xHub : xMax, y, cz, fwd ? xMax : xHub, y, cz, SZ);
         }
       } else {
@@ -171,11 +261,38 @@ export function getDefaultGCode(): string {
     circle(L, r, domeZ, SZ, 150, 800);
   }
 
-  // Channel floors between blades at a few Z levels
+  // Channel floor cleanup (concentric arcs between blades)
   L.push('(-- Channel floor cleanup --)');
+  const TR3 = 4; // T3 tool radius
+  const BLADE_CLR_SEMI = TR3 + 0.5;
   for (let z = 0; z >= -3; z -= 1.5) {
-    for (let r = HUB_R + 2; r <= BLADE_OUTER_R - 2; r += 3) {
-      circle(L, r, z, SZ, 200, 1000);
+    for (let r = HUB_R + 5; r <= BLADE_OUTER_R - 2; r += 3) {
+      // Generate arc segments that avoid blades
+      const nSteps = Math.max(36, Math.ceil(2 * Math.PI * r / 2));
+      let cutting = false;
+      for (let s = 0; s <= nSteps; s++) {
+        const angle = (s / nSteps) * 2 * Math.PI;
+        const px = r * Math.cos(angle);
+        const py = r * Math.sin(angle);
+
+        if (!isNearBlade(px, py, z, BLADE_CLR_SEMI)) {
+          if (!cutting) {
+            L.push(`G0 X${px.toFixed(2)} Y${py.toFixed(2)}`);
+            L.push(`G1 Z${z.toFixed(1)} F200`);
+            cutting = true;
+          } else {
+            L.push(`G1 X${px.toFixed(2)} Y${py.toFixed(2)} F1000`);
+          }
+        } else {
+          if (cutting) {
+            L.push(`G0 Z${SZ}`);
+            cutting = false;
+          }
+        }
+      }
+      if (cutting) {
+        L.push(`G0 Z${SZ}`);
+      }
     }
   }
 
@@ -189,37 +306,28 @@ export function getDefaultGCode(): string {
   L.push(`G0 Z${SZ}`);
 
   // For each blade, generate 5-axis toolpath along both sides
-  // Tool follows the blade surface with the tool tilted to match blade normal
-  const FINISH_STEP_Z = 1.5;  // Z step between passes
-  const FINISH_STEP_R = 1.0;  // radial step
+  const FINISH_STEP_Z = 1.5;
+  const FINISH_STEP_R = 1.0;
 
   for (let b = 0; b < NUM_BLADES; b++) {
     L.push(`(-- Blade ${b + 1} finishing --)`);
 
-    // Machine both sides of each blade
     for (const side of [-1, 1]) {
-      // From hub to tip at multiple Z levels
       for (let z = 0; z <= BLADE_HEIGHT; z += FINISH_STEP_Z) {
         const pts: { x: number; y: number; z: number; a: number; b: number }[] = [];
 
         for (let r = HUB_R + 1; r <= BLADE_OUTER_R - 1; r += FINISH_STEP_R) {
           const ba = bladeAngle(b, r, z);
-          // Offset to blade surface (side)
           const halfW = BLADE_THICKNESS / (2 * r);
           const surfAngle = ba + side * halfW;
 
-          // Tool tip position on blade surface
           const tx = r * Math.cos(surfAngle);
           const ty = r * Math.sin(surfAngle);
           const tz = z;
 
-          // Tool tilt: lean away from blade surface
-          // Normal to blade surface points radially outward + tangential
-          const tiltAngle = side * 15; // 15 degrees lean
+          const tiltAngle = side * 15;
           const bladeNormalAngle = surfAngle + side * Math.PI / 2;
-          // A-axis tilt (around X): component from blade normal
           const aAx = tiltAngle * Math.cos(bladeNormalAngle);
-          // B-axis tilt (around Y): component from blade normal
           const bAx = tiltAngle * Math.sin(bladeNormalAngle);
 
           pts.push({ x: tx, y: ty, z: tz, a: aAx, b: bAx });
@@ -227,12 +335,10 @@ export function getDefaultGCode(): string {
 
         if (pts.length < 2) continue;
 
-        // Rapid to start
         L.push(`G0 X${pts[0].x.toFixed(2)} Y${pts[0].y.toFixed(2)}`);
         L.push(`G0 Z${(pts[0].z + 3).toFixed(1)}`);
         L.push(`G1 Z${pts[0].z.toFixed(2)} A${pts[0].a.toFixed(2)} B${pts[0].b.toFixed(2)} F150`);
 
-        // Cut along blade surface
         for (let i = 1; i < pts.length; i++) {
           const p = pts[i];
           L.push(`G1 X${p.x.toFixed(2)} Y${p.y.toFixed(2)} Z${p.z.toFixed(2)} A${p.a.toFixed(2)} B${p.b.toFixed(2)} F500`);
@@ -247,17 +353,15 @@ export function getDefaultGCode(): string {
   L.push('(-- Hub dome 5-axis finishing --)');
   for (let r = 1; r <= HUB_R - 0.5; r += 0.8) {
     const domeZ = 20 + 3 * Math.sqrt(Math.max(0, 1 - (r / HUB_R) * (r / HUB_R)));
-    // Tool tilts outward to follow dome curvature
-    const tiltDeg = (r / HUB_R) * 25; // more tilt at larger radius
+    const tiltDeg = (r / HUB_R) * 25;
     const nSteps = Math.max(16, Math.ceil(2 * Math.PI * r / 1.0));
 
     for (let s = 0; s <= nSteps; s++) {
       const angle = (s / nSteps) * 2 * Math.PI;
       const px = r * Math.cos(angle);
       const py = r * Math.sin(angle);
-      // Tilt direction: radially outward
-      const aAx = tiltDeg * Math.sin(angle);  // A = tilt around X
-      const bAx = -tiltDeg * Math.cos(angle); // B = tilt around Y
+      const aAx = tiltDeg * Math.sin(angle);
+      const bAx = -tiltDeg * Math.cos(angle);
 
       if (s === 0) {
         L.push(`G0 X${px.toFixed(2)} Y${py.toFixed(2)}`);
@@ -313,7 +417,6 @@ export function getDomeTargetHeight(
   cx: number, cy: number, radius: number,
   baseZ: number, topZ: number
 ): (x: number, y: number) => number {
-  // Keep isInsideBlade accessible for potential future use
   void isInsideBlade;
   return (x: number, y: number) => {
     const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
