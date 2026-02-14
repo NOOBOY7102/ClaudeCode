@@ -28,6 +28,7 @@ export function Viewer3D() {
     toolpath,
     showToolpath,
     showTool,
+    showStock,
     showTarget,
     simState,
     tick,
@@ -162,14 +163,15 @@ export function Viewer3D() {
     if (stockMeshRef.current) {
       scene.remove(stockMeshRef.current);
       stockMeshRef.current.geometry.dispose();
+      stockMeshRef.current = null;
     }
 
-    if (stockGeometry) {
+    if (stockGeometry && showStock) {
       const mesh = new THREE.Mesh(stockGeometry, material);
       scene.add(mesh);
       stockMeshRef.current = mesh;
     }
-  }, [stockGeometry]);
+  }, [stockGeometry, showStock]);
 
   // Update target mesh
   useEffect(() => {

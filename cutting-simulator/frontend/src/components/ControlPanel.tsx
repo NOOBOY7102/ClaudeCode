@@ -21,6 +21,8 @@ export function ControlPanel() {
     setShowTool,
     showTarget,
     setShowTarget,
+    showStock,
+    setShowStock,
     resolution,
     setResolution,
   } = useStore();
@@ -178,6 +180,14 @@ export function ControlPanel() {
               onChange={e => setShowTool(e.target.checked)}
             />
             Show Tool
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={showStock}
+              onChange={e => setShowStock(e.target.checked)}
+            />
+            Show Stock
           </label>
           <label>
             <input

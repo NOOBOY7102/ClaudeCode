@@ -197,7 +197,7 @@ function buildZBottomSurface(
 }
 
 // =================================================================
-// Side walls from Z-grid boundary detection
+// Side walls from Z-grid boundary detection (smooth normals)
 // =================================================================
 function buildSideWalls(
   model: DexelModel,
@@ -224,10 +224,27 @@ function buildSideWalls(
     }
   }
 
-  const g = 0.55; // wall color (slightly darker than top)
+  // Precompute gradient-based smooth normals per cell for wall faces.
+  // The gradient of the top height field gives the outward wall direction.
+  const gradX = new Float32Array(totalCells);
+  const gradY = new Float32Array(totalCells);
+  for (let iy = 1; iy < ny - 1; iy++) {
+    for (let ix = 1; ix < nx - 1; ix++) {
+      const ci = iy * nx + ix;
+      if (!hasMat[ci]) continue;
+      // Central difference on topZ (treat empty cells as low)
+      const zL = hasMat[ci - 1] ? topZ[ci - 1] : topZ[ci] - cs * 4;
+      const zR = hasMat[ci + 1] ? topZ[ci + 1] : topZ[ci] - cs * 4;
+      const zD = hasMat[ci - nx] ? topZ[ci - nx] : topZ[ci] - cs * 4;
+      const zU = hasMat[ci + nx] ? topZ[ci + nx] : topZ[ci] - cs * 4;
+      gradX[ci] = (zR - zL) / (2 * cs);
+      gradY[ci] = (zU - zD) / (2 * cs);
+    }
+  }
+
+  const g = 0.55;
   let vIdx = baseVert;
 
-  // For each cell, check 4 neighbors. Generate wall quads at boundaries.
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
       const ci = iy * nx + ix;
@@ -239,53 +256,94 @@ function buildSideWalls(
       const zb = botZ[ci];
       const h = cs * 0.5;
 
+      // Smooth normal: blend axis normal with gradient direction
+      const gx = gradX[ci], gy = gradY[ci];
+
       // -X wall
       if (ix === 0 || !hasMat[ci - 1]) {
+        const sn = smoothWallNormal(-1, 0, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy - h, cx - h, cy + h, zb, zt, -1, 0, 0, g, vIdx);
+          cx - h, cy - h, cx - h, cy + h, zb, zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       } else if (topZ[ci - 1] < zt - cs * 0.1) {
+        const sn = smoothWallNormal(-1, 0, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy - h, cx - h, cy + h, topZ[ci - 1], zt, -1, 0, 0, g, vIdx);
+          cx - h, cy - h, cx - h, cy + h, topZ[ci - 1], zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       }
 
       // +X wall
       if (ix === nx - 1 || !hasMat[ci + 1]) {
+        const sn = smoothWallNormal(1, 0, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy + h, cx + h, cy - h, zb, zt, 1, 0, 0, g, vIdx);
+          cx + h, cy + h, cx + h, cy - h, zb, zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       } else if (topZ[ci + 1] < zt - cs * 0.1) {
+        const sn = smoothWallNormal(1, 0, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy + h, cx + h, cy - h, topZ[ci + 1], zt, 1, 0, 0, g, vIdx);
+          cx + h, cy + h, cx + h, cy - h, topZ[ci + 1], zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       }
 
       // -Y wall
       if (iy === 0 || !hasMat[ci - nx]) {
+        const sn = smoothWallNormal(0, -1, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy - h, cx - h, cy - h, zb, zt, 0, -1, 0, g, vIdx);
+          cx + h, cy - h, cx - h, cy - h, zb, zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       } else if (topZ[ci - nx] < zt - cs * 0.1) {
+        const sn = smoothWallNormal(0, -1, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy - h, cx - h, cy - h, topZ[ci - nx], zt, 0, -1, 0, g, vIdx);
+          cx + h, cy - h, cx - h, cy - h, topZ[ci - nx], zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       }
 
       // +Y wall
       if (iy === ny - 1 || !hasMat[ci + nx]) {
+        const sn = smoothWallNormal(0, 1, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy + h, cx + h, cy + h, zb, zt, 0, 1, 0, g, vIdx);
+          cx - h, cy + h, cx + h, cy + h, zb, zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       } else if (topZ[ci + nx] < zt - cs * 0.1) {
+        const sn = smoothWallNormal(0, 1, gx, gy);
         pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy + h, cx + h, cy + h, topZ[ci + nx], zt, 0, 1, 0, g, vIdx);
+          cx - h, cy + h, cx + h, cy + h, topZ[ci + nx], zt, sn[0], sn[1], 0, g, vIdx);
         vIdx += 4;
       }
     }
   }
 
   return vIdx;
+}
+
+/**
+ * Compute a smooth wall normal by blending the face axis normal
+ * with the height gradient direction.
+ */
+function smoothWallNormal(
+  axisNx: number, axisNy: number,
+  gradX: number, gradY: number,
+): [number, number] {
+  // The gradient of the top-Z field points "uphill".
+  // For a wall face, the outward normal should point roughly in the
+  // direction of -gradient (perpendicular to contour lines).
+  // Blend axis normal with gradient-based normal for smooth shading.
+  const gLen = Math.sqrt(gradX * gradX + gradY * gradY);
+  if (gLen < 0.01) return [axisNx, axisNy]; // flat area, keep axis normal
+
+  // gradient-derived outward normal (negative gradient = downhill = outward)
+  const gnx = -gradX / gLen;
+  const gny = -gradY / gLen;
+
+  // Only blend if gradient agrees with axis direction (dot > 0)
+  const dot = axisNx * gnx + axisNy * gny;
+  if (dot < 0.1) return [axisNx, axisNy];
+
+  // Blend: 60% gradient, 40% axis
+  const bx = gnx * 0.6 + axisNx * 0.4;
+  const by = gny * 0.6 + axisNy * 0.4;
+  const bLen = Math.sqrt(bx * bx + by * by) || 1;
+  return [bx / bLen, by / bLen];
 }
 
 /** Push an indexed wall quad (4 vertices, 2 triangles) */
@@ -296,7 +354,6 @@ function pushWallQuad(
   wnx: number, wny: number, wnz: number,
   g: number, baseIdx: number
 ): void {
-  // 4 vertices: bottom-left, bottom-right, top-right, top-left
   pos.push(x0, y0, zBot);
   pos.push(x1, y1, zBot);
   pos.push(x1, y1, zTop);
@@ -307,7 +364,6 @@ function pushWallQuad(
     col.push(g, g, g + 0.03);
   }
 
-  // Two triangles: 0-1-2, 0-2-3
   idx.push(baseIdx, baseIdx + 1, baseIdx + 2);
   idx.push(baseIdx, baseIdx + 2, baseIdx + 3);
 }

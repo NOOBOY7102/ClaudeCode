@@ -4,7 +4,7 @@ import { SimulationRunner } from '../engine/SimulationRunner';
 import { parseGCode } from '../engine/GCodeParser';
 import { dexelToMesh } from '../engine/DexelMesh';
 import { defaultTools, defaultStock, getDefaultGCode } from '../engine/SampleData';
-import { buildTargetModel } from '../engine/TargetShape';
+import { buildTargetMesh } from '../engine/TargetShape';
 import type { ToolDefinition, ToolpathSegment, SimState, BBox } from '../types';
 import * as THREE from 'three';
 
@@ -50,6 +50,7 @@ interface AppState {
   setShowToolpath: (v: boolean) => void;
   setShowTool: (v: boolean) => void;
   setShowTarget: (v: boolean) => void;
+  setShowStock: (v: boolean) => void;
   setResolution: (r: number) => void;
   tick: () => boolean; // returns true if simulation updated
 }
@@ -104,9 +105,8 @@ export const useStore = create<AppState>((set, get) => ({
     // Generate initial mesh
     const mesh = dexelToMesh(model, state.colorMode);
 
-    // Build target shape model and mesh
-    const target = buildTargetModel(bbox, res);
-    const tMesh = dexelToMesh(target, 'solid');
+    // Build smooth target shape mesh (parametric STL)
+    const tMesh = buildTargetMesh();
 
     set({
       dexelModel: model,
@@ -224,6 +224,7 @@ export const useStore = create<AppState>((set, get) => ({
   setShowToolpath: (v) => set({ showToolpath: v }),
   setShowTool: (v) => set({ showTool: v }),
   setShowTarget: (v) => set({ showTarget: v }),
+  setShowStock: (v) => set({ showStock: v }),
 
   setResolution: (r) => {
     set({ resolution: r });
