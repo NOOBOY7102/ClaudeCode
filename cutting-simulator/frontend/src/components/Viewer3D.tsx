@@ -11,13 +11,16 @@ export function Viewer3D() {
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const stockMeshRef = useRef<THREE.Mesh | null>(null);
+  const targetMeshRef = useRef<THREE.Mesh | null>(null);
   const toolGroupRef = useRef<THREE.Group | null>(null);
   const toolpathGroupRef = useRef<THREE.Group | null>(null);
   const animFrameRef = useRef<number>(0);
   const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+  const targetMaterialRef = useRef<THREE.MeshStandardMaterial | null>(null);
 
   const {
     stockMesh: stockGeometry,
+    targetMesh: targetGeometry,
     toolPosition,
     toolAxis,
     currentToolId,
@@ -25,6 +28,7 @@ export function Viewer3D() {
     toolpath,
     showToolpath,
     showTool,
+    showTarget,
     simState,
     tick,
   } = useStore();
@@ -120,6 +124,17 @@ export function Viewer3D() {
     });
     materialRef.current = stockMaterial;
 
+    // Target shape material (green, semi-transparent)
+    const targetMaterial = new THREE.MeshStandardMaterial({
+      color: 0x22cc66,
+      side: THREE.DoubleSide,
+      metalness: 0.3,
+      roughness: 0.6,
+      transparent: true,
+      opacity: 0.6,
+    });
+    targetMaterialRef.current = targetMaterial;
+
     // Resize
     const handleResize = () => {
       const w = container.clientWidth;
@@ -155,6 +170,25 @@ export function Viewer3D() {
       stockMeshRef.current = mesh;
     }
   }, [stockGeometry]);
+
+  // Update target mesh
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const material = targetMaterialRef.current;
+    if (!scene || !material) return;
+
+    if (targetMeshRef.current) {
+      scene.remove(targetMeshRef.current);
+      targetMeshRef.current.geometry.dispose();
+      targetMeshRef.current = null;
+    }
+
+    if (targetGeometry && showTarget) {
+      const mesh = new THREE.Mesh(targetGeometry, material);
+      scene.add(mesh);
+      targetMeshRef.current = mesh;
+    }
+  }, [targetGeometry, showTarget]);
 
   // Update tool position
   useEffect(() => {

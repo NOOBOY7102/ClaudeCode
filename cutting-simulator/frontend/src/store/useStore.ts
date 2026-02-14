@@ -4,6 +4,7 @@ import { SimulationRunner } from '../engine/SimulationRunner';
 import { parseGCode } from '../engine/GCodeParser';
 import { dexelToMesh } from '../engine/DexelMesh';
 import { defaultTools, defaultStock, getDefaultGCode } from '../engine/SampleData';
+import { buildTargetModel } from '../engine/TargetShape';
 import type { ToolDefinition, ToolpathSegment, SimState, BBox } from '../types';
 import * as THREE from 'three';
 
@@ -31,9 +32,11 @@ interface AppState {
   showToolpath: boolean;
   showTool: boolean;
   showStock: boolean;
+  showTarget: boolean;
 
   // Three.js objects (managed externally by Viewer)
   stockMesh: THREE.BufferGeometry | null;
+  targetMesh: THREE.BufferGeometry | null;
 
   // Actions
   initialize: () => void;
@@ -46,6 +49,7 @@ interface AppState {
   setColorMode: (mode: 'solid' | 'heightmap' | 'difference') => void;
   setShowToolpath: (v: boolean) => void;
   setShowTool: (v: boolean) => void;
+  setShowTarget: (v: boolean) => void;
   setResolution: (r: number) => void;
   tick: () => boolean; // returns true if simulation updated
 }
@@ -70,7 +74,9 @@ export const useStore = create<AppState>((set, get) => ({
   showToolpath: true,
   showTool: true,
   showStock: true,
+  showTarget: false,
   stockMesh: null,
+  targetMesh: null,
 
   initialize: () => {
     const state = get();
@@ -98,6 +104,10 @@ export const useStore = create<AppState>((set, get) => ({
     // Generate initial mesh
     const mesh = dexelToMesh(model, state.colorMode);
 
+    // Build target shape model and mesh
+    const target = buildTargetModel(bbox, res);
+    const tMesh = dexelToMesh(target, 'solid');
+
     set({
       dexelModel: model,
       initialModel: initial,
@@ -106,6 +116,7 @@ export const useStore = create<AppState>((set, get) => ({
       runner,
       simState: 'idle',
       stockMesh: mesh,
+      targetMesh: tMesh,
       progressPercent: 0,
       toolPosition: null,
       toolAxis: null,
@@ -212,6 +223,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setShowToolpath: (v) => set({ showToolpath: v }),
   setShowTool: (v) => set({ showTool: v }),
+  setShowTarget: (v) => set({ showTarget: v }),
 
   setResolution: (r) => {
     set({ resolution: r });
