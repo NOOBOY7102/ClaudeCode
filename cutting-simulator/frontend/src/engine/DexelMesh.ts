@@ -2,375 +2,255 @@ import * as THREE from 'three';
 import { DexelModel } from './DexelModel';
 
 /**
- * Tri-Dexel mesh generation.
+ * Tri-Dexel → smooth mesh via Marching Cubes.
  *
- * - Z-grid → top surface heightmap (Sobel normals, smooth shading)
- * - Z-grid boundary analysis → side walls (at material/air transitions)
- *
- * The X/Y dexel grids improve simulation accuracy but are NOT used for
- * rendering directly (they produce interior faces). Instead, side walls
- * are generated from Z-grid boundary detection.
+ * 1. Sample the tri-dexel (Z/X/Y grids) into a 3D scalar field.
+ *    Each voxel stores the fraction of dexel rays that report "inside material".
+ * 2. Run Marching Cubes on the scalar field (iso = 0.5) to extract a smooth surface.
+ * 3. Compute gradient-based normals from the scalar field for smooth shading.
  */
+
+// =====================================================================
+//  Main entry point
+// =====================================================================
 export function dexelToMesh(
   model: DexelModel,
   colorMode: 'solid' | 'heightmap' | 'difference' = 'solid',
   _targetModel?: DexelModel
 ): THREE.BufferGeometry {
-  const allPos: number[] = [];
-  const allNrm: number[] = [];
-  const allCol: number[] = [];
-  const allIdx: number[] = [];
-  let baseVert = 0;
+  const { bbox, resolution: dcs } = model;
+  // Use coarser MC grid for performance (2x dexel resolution)
+  const MC_SCALE = 2;
+  const cs = dcs * MC_SCALE;
+  // Add 1-cell padding so MC finds the bbox boundary surface
+  const PAD = 1;
+  const mcNx = Math.ceil(model.nx / MC_SCALE);
+  const mcNy = Math.ceil(model.ny / MC_SCALE);
+  const mcNz = Math.ceil(model.nz / MC_SCALE);
+  const fnx = mcNx + 1 + 2 * PAD;
+  const fny = mcNy + 1 + 2 * PAD;
+  const fnz = mcNz + 1 + 2 * PAD;
+  const ox = bbox.minX - PAD * cs;
+  const oy = bbox.minY - PAD * cs;
+  const oz = bbox.minZ - PAD * cs;
 
-  // --- Z-grid: top surface ---
-  baseVert = buildZTopSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert);
+  // Build scalar field from tri-dexel
+  const size = fnx * fny * fnz;
+  const field = new Float32Array(size);
 
-  // --- Z-grid: bottom surface ---
-  baseVert = buildZBottomSurface(model, colorMode, allPos, allNrm, allCol, allIdx, baseVert);
+  sampleTriDexelField(model, field, fnx, fny, fnz, ox, oy, oz, cs);
 
-  // --- Side walls from Z-grid boundary analysis ---
-  buildSideWalls(model, allPos, allNrm, allCol, allIdx, baseVert);
+  // Run Marching Cubes
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const colors: number[] = [];
+
+  const zMin = bbox.minZ;
+  const zMax = bbox.maxZ;
+  const zRange = zMax - zMin + 0.001;
+
+  marchingCubes(
+    field, fnx, fny, fnz,
+    0.5, // iso level
+    ox, oy, oz,
+    cs, cs, cs,
+    positions, normals,
+    (z: number) => {
+      const c = surfaceColor(colorMode, z, zMin, zRange);
+      colors.push(c[0], c[1], c[2]);
+    }
+  );
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(allPos, 3));
-  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(allNrm, 3));
-  geometry.setAttribute('color', new THREE.Float32BufferAttribute(allCol, 3));
-  geometry.setIndex(allIdx);
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
   return geometry;
 }
 
-// =================================================================
-// Z-grid top surface
-// =================================================================
-function buildZTopSurface(
-  model: DexelModel,
-  colorMode: string,
-  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
-  baseVert: number
-): number {
-  const { nx, ny } = model;
-  const cs = model.resolution;
-  const ox = model.bbox.minX;
-  const oy = model.bbox.minY;
-  const totalCells = nx * ny;
-  const segments = model.zGrid.segments;
-
-  const topZ = new Float32Array(totalCells);
-  const hasMat = new Uint8Array(totalCells);
-  let zMin = 1e9, zMax = -1e9;
-
-  for (let i = 0; i < totalCells; i++) {
-    const seg = segments[i];
-    if (seg.length >= 2) {
-      hasMat[i] = 1;
-      topZ[i] = seg[seg.length - 1];
-      if (topZ[i] > zMax) zMax = topZ[i];
-      if (topZ[i] < zMin) zMin = topZ[i];
-    }
-  }
-  const zRange = zMax - zMin + 0.001;
-
-  const vertIdx = new Int32Array(totalCells).fill(-1);
-  let vertCount = 0;
-  for (let i = 0; i < totalCells; i++) {
-    if (hasMat[i]) vertIdx[i] = vertCount++;
-  }
-
-  for (let iy = 0; iy < ny; iy++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iy * nx + ix;
-      if (vertIdx[ci] < 0) continue;
-
-      allPos.push(ox + (ix + 0.5) * cs, oy + (iy + 0.5) * cs, topZ[ci]);
-
-      // Sobel 3x3 normal
-      const zC = topZ[ci];
-      const zL  = (ix > 0      && hasMat[ci - 1])  ? topZ[ci - 1]  : zC;
-      const zR  = (ix < nx - 1 && hasMat[ci + 1])  ? topZ[ci + 1]  : zC;
-      const zD  = (iy > 0      && hasMat[ci - nx])  ? topZ[ci - nx]  : zC;
-      const zU  = (iy < ny - 1 && hasMat[ci + nx])  ? topZ[ci + nx]  : zC;
-      const zLD = (ix > 0      && iy > 0      && hasMat[ci - nx - 1]) ? topZ[ci - nx - 1] : zC;
-      const zRD = (ix < nx - 1 && iy > 0      && hasMat[ci - nx + 1]) ? topZ[ci - nx + 1] : zC;
-      const zLU = (ix > 0      && iy < ny - 1 && hasMat[ci + nx - 1]) ? topZ[ci + nx - 1] : zC;
-      const zRU = (ix < nx - 1 && iy < ny - 1 && hasMat[ci + nx + 1]) ? topZ[ci + nx + 1] : zC;
-
-      const dzdx = ((zRD + 2 * zR + zRU) - (zLD + 2 * zL + zLU)) / (8 * cs);
-      const dzdy = ((zLU + 2 * zU + zRU) - (zLD + 2 * zD + zRD)) / (8 * cs);
-      const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
-      allNrm.push(-dzdx / len, -dzdy / len, 1 / len);
-
-      const c = surfaceColor(colorMode, topZ[ci], zMin, zRange);
-      allCol.push(c[0], c[1], c[2]);
-    }
-  }
-
-  for (let iy = 0; iy < ny - 1; iy++) {
-    for (let ix = 0; ix < nx - 1; ix++) {
-      const v00 = vertIdx[iy * nx + ix];
-      const v10 = vertIdx[iy * nx + ix + 1];
-      const v01 = vertIdx[(iy + 1) * nx + ix];
-      const v11 = vertIdx[(iy + 1) * nx + ix + 1];
-      if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-        allIdx.push(baseVert + v00, baseVert + v10, baseVert + v01);
-      if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-        allIdx.push(baseVert + v10, baseVert + v11, baseVert + v01);
-    }
-  }
-
-  return baseVert + vertCount;
-}
-
-// =================================================================
-// Z-grid bottom surface (inverted normals)
-// =================================================================
-function buildZBottomSurface(
-  model: DexelModel,
-  _colorMode: string,
-  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
-  baseVert: number
-): number {
-  const { nx, ny } = model;
-  const cs = model.resolution;
-  const ox = model.bbox.minX;
-  const oy = model.bbox.minY;
-  const totalCells = nx * ny;
-  const segments = model.zGrid.segments;
-
-  const botZ = new Float32Array(totalCells);
-  const hasMat = new Uint8Array(totalCells);
-
-  for (let i = 0; i < totalCells; i++) {
-    const seg = segments[i];
-    if (seg.length >= 2) {
-      hasMat[i] = 1;
-      botZ[i] = seg[0];
-    }
-  }
-
-  const vertIdx = new Int32Array(totalCells).fill(-1);
-  let vertCount = 0;
-
-  // Only add bottom surface vertices at boundary cells (where neighbors differ or are empty)
-  for (let iy = 0; iy < ny; iy++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iy * nx + ix;
-      if (!hasMat[ci]) continue;
-      // Check if this cell is near a boundary or has a different bottom from stock
-      const isEdge = ix === 0 || ix === nx - 1 || iy === 0 || iy === ny - 1;
-      const hasEmptyNeighbor =
-        (ix > 0 && !hasMat[ci - 1]) || (ix < nx - 1 && !hasMat[ci + 1]) ||
-        (iy > 0 && !hasMat[ci - nx]) || (iy < ny - 1 && !hasMat[ci + nx]);
-      if (isEdge || hasEmptyNeighbor) {
-        vertIdx[ci] = vertCount++;
-      }
-    }
-  }
-
-  const g = 0.45; // darker color for bottom
-
-  for (let iy = 0; iy < ny; iy++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iy * nx + ix;
-      if (vertIdx[ci] < 0) continue;
-      allPos.push(ox + (ix + 0.5) * cs, oy + (iy + 0.5) * cs, botZ[ci]);
-      allNrm.push(0, 0, -1);
-      allCol.push(g, g, g + 0.03);
-    }
-  }
-
-  for (let iy = 0; iy < ny - 1; iy++) {
-    for (let ix = 0; ix < nx - 1; ix++) {
-      const v00 = vertIdx[iy * nx + ix];
-      const v10 = vertIdx[iy * nx + ix + 1];
-      const v01 = vertIdx[(iy + 1) * nx + ix];
-      const v11 = vertIdx[(iy + 1) * nx + ix + 1];
-      // Reverse winding for bottom face
-      if (v00 >= 0 && v10 >= 0 && v01 >= 0)
-        allIdx.push(baseVert + v00, baseVert + v01, baseVert + v10);
-      if (v10 >= 0 && v11 >= 0 && v01 >= 0)
-        allIdx.push(baseVert + v10, baseVert + v01, baseVert + v11);
-    }
-  }
-
-  return baseVert + vertCount;
-}
-
-// =================================================================
-// Side walls from Z-grid boundary detection (smooth normals)
-// =================================================================
-function buildSideWalls(
-  model: DexelModel,
-  allPos: number[], allNrm: number[], allCol: number[], allIdx: number[],
-  baseVert: number
-): number {
-  const { nx, ny } = model;
-  const cs = model.resolution;
-  const ox = model.bbox.minX;
-  const oy = model.bbox.minY;
-  const segments = model.zGrid.segments;
-  const totalCells = nx * ny;
-
-  const topZ = new Float32Array(totalCells);
-  const botZ = new Float32Array(totalCells);
-  const hasMat = new Uint8Array(totalCells);
-
-  for (let i = 0; i < totalCells; i++) {
-    const seg = segments[i];
-    if (seg.length >= 2) {
-      hasMat[i] = 1;
-      topZ[i] = seg[seg.length - 1];
-      botZ[i] = seg[0];
-    }
-  }
-
-  // Precompute gradient-based smooth normals per cell for wall faces.
-  // The gradient of the top height field gives the outward wall direction.
-  const gradX = new Float32Array(totalCells);
-  const gradY = new Float32Array(totalCells);
-  for (let iy = 1; iy < ny - 1; iy++) {
-    for (let ix = 1; ix < nx - 1; ix++) {
-      const ci = iy * nx + ix;
-      if (!hasMat[ci]) continue;
-      // Central difference on topZ (treat empty cells as low)
-      const zL = hasMat[ci - 1] ? topZ[ci - 1] : topZ[ci] - cs * 4;
-      const zR = hasMat[ci + 1] ? topZ[ci + 1] : topZ[ci] - cs * 4;
-      const zD = hasMat[ci - nx] ? topZ[ci - nx] : topZ[ci] - cs * 4;
-      const zU = hasMat[ci + nx] ? topZ[ci + nx] : topZ[ci] - cs * 4;
-      gradX[ci] = (zR - zL) / (2 * cs);
-      gradY[ci] = (zU - zD) / (2 * cs);
-    }
-  }
-
-  const g = 0.55;
-  let vIdx = baseVert;
-
-  for (let iy = 0; iy < ny; iy++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const ci = iy * nx + ix;
-      if (!hasMat[ci]) continue;
-
-      const cx = ox + (ix + 0.5) * cs;
-      const cy = oy + (iy + 0.5) * cs;
-      const zt = topZ[ci];
-      const zb = botZ[ci];
-      const h = cs * 0.5;
-
-      // Smooth normal: blend axis normal with gradient direction
-      const gx = gradX[ci], gy = gradY[ci];
-
-      // -X wall
-      if (ix === 0 || !hasMat[ci - 1]) {
-        const sn = smoothWallNormal(-1, 0, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy - h, cx - h, cy + h, zb, zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      } else if (topZ[ci - 1] < zt - cs * 0.1) {
-        const sn = smoothWallNormal(-1, 0, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy - h, cx - h, cy + h, topZ[ci - 1], zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      }
-
-      // +X wall
-      if (ix === nx - 1 || !hasMat[ci + 1]) {
-        const sn = smoothWallNormal(1, 0, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy + h, cx + h, cy - h, zb, zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      } else if (topZ[ci + 1] < zt - cs * 0.1) {
-        const sn = smoothWallNormal(1, 0, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy + h, cx + h, cy - h, topZ[ci + 1], zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      }
-
-      // -Y wall
-      if (iy === 0 || !hasMat[ci - nx]) {
-        const sn = smoothWallNormal(0, -1, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy - h, cx - h, cy - h, zb, zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      } else if (topZ[ci - nx] < zt - cs * 0.1) {
-        const sn = smoothWallNormal(0, -1, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx + h, cy - h, cx - h, cy - h, topZ[ci - nx], zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      }
-
-      // +Y wall
-      if (iy === ny - 1 || !hasMat[ci + nx]) {
-        const sn = smoothWallNormal(0, 1, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy + h, cx + h, cy + h, zb, zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      } else if (topZ[ci + nx] < zt - cs * 0.1) {
-        const sn = smoothWallNormal(0, 1, gx, gy);
-        pushWallQuad(allPos, allNrm, allCol, allIdx,
-          cx - h, cy + h, cx + h, cy + h, topZ[ci + nx], zt, sn[0], sn[1], 0, g, vIdx);
-        vIdx += 4;
-      }
-    }
-  }
-
-  return vIdx;
-}
+// =====================================================================
+//  Tri-dexel → scalar field sampling
+// =====================================================================
 
 /**
- * Compute a smooth wall normal by blending the face axis normal
- * with the height gradient direction.
+ * Sample the tri-dexel model into a 3D scalar field.
+ * For each grid vertex, query each dexel grid for inside/outside.
+ * Majority vote (>=2 of 3) → solid.
  */
-function smoothWallNormal(
-  axisNx: number, axisNy: number,
-  gradX: number, gradY: number,
-): [number, number] {
-  // The gradient of the top-Z field points "uphill".
-  // For a wall face, the outward normal should point roughly in the
-  // direction of -gradient (perpendicular to contour lines).
-  // Blend axis normal with gradient-based normal for smooth shading.
-  const gLen = Math.sqrt(gradX * gradX + gradY * gradY);
-  if (gLen < 0.01) return [axisNx, axisNy]; // flat area, keep axis normal
-
-  // gradient-derived outward normal (negative gradient = downhill = outward)
-  const gnx = -gradX / gLen;
-  const gny = -gradY / gLen;
-
-  // Only blend if gradient agrees with axis direction (dot > 0)
-  const dot = axisNx * gnx + axisNy * gny;
-  if (dot < 0.1) return [axisNx, axisNy];
-
-  // Blend: 60% gradient, 40% axis
-  const bx = gnx * 0.6 + axisNx * 0.4;
-  const by = gny * 0.6 + axisNy * 0.4;
-  const bLen = Math.sqrt(bx * bx + by * by) || 1;
-  return [bx / bLen, by / bLen];
-}
-
-/** Push an indexed wall quad (4 vertices, 2 triangles) */
-function pushWallQuad(
-  pos: number[], nrm: number[], col: number[], idx: number[],
-  x0: number, y0: number, x1: number, y1: number,
-  zBot: number, zTop: number,
-  wnx: number, wny: number, wnz: number,
-  g: number, baseIdx: number
+function sampleTriDexelField(
+  model: DexelModel,
+  field: Float32Array,
+  fnx: number, fny: number, fnz: number,
+  ox: number, oy: number, oz: number,
+  cs: number
 ): void {
-  pos.push(x0, y0, zBot);
-  pos.push(x1, y1, zBot);
-  pos.push(x1, y1, zTop);
-  pos.push(x0, y0, zTop);
+  const { bbox } = model;
+  const { nx, ny, nz } = model;
 
-  for (let i = 0; i < 4; i++) {
-    nrm.push(wnx, wny, wnz);
-    col.push(g, g, g + 0.03);
+  for (let iz = 0; iz < fnz; iz++) {
+    const wz = oz + iz * cs;
+    for (let iy = 0; iy < fny; iy++) {
+      const wy = oy + iy * cs;
+      for (let ix = 0; ix < fnx; ix++) {
+        const wx = ox + ix * cs;
+        const fi = iz * fny * fnx + iy * fnx + ix;
+
+        let votes = 0;
+
+        // Z-grid: column at (wx, wy), check if wz is inside
+        const zix = Math.floor((wx - bbox.minX) / cs);
+        const ziy = Math.floor((wy - bbox.minY) / cs);
+        if (zix >= 0 && zix < nx && ziy >= 0 && ziy < ny) {
+          const zSegs = model.zGrid.segments[ziy * nx + zix];
+          if (isInsideSegments(zSegs, wz)) votes++;
+        }
+
+        // X-grid: column at (wy, wz), check if wx is inside
+        const xiy = Math.floor((wy - bbox.minY) / cs);
+        const xiz = Math.floor((wz - bbox.minZ) / cs);
+        if (xiy >= 0 && xiy < ny && xiz >= 0 && xiz < nz) {
+          const xSegs = model.xGrid.segments[xiz * ny + xiy];
+          if (isInsideSegments(xSegs, wx)) votes++;
+        }
+
+        // Y-grid: column at (wx, wz), check if wy is inside
+        const yix = Math.floor((wx - bbox.minX) / cs);
+        const yiz = Math.floor((wz - bbox.minZ) / cs);
+        if (yix >= 0 && yix < nx && yiz >= 0 && yiz < nz) {
+          const ySegs = model.yGrid.segments[yiz * nx + yix];
+          if (isInsideSegments(ySegs, wy)) votes++;
+        }
+
+        field[fi] = votes >= 2 ? 1.0 : 0.0;
+      }
+    }
   }
-
-  idx.push(baseIdx, baseIdx + 1, baseIdx + 2);
-  idx.push(baseIdx, baseIdx + 2, baseIdx + 3);
 }
 
-// =================================================================
-// Shared helpers
-// =================================================================
+/** Check if value t is inside any segment pair [start, end, start, end, ...] */
+function isInsideSegments(segs: Float32Array, t: number): boolean {
+  for (let i = 0; i < segs.length; i += 2) {
+    if (t >= segs[i] && t <= segs[i + 1]) return true;
+  }
+  return false;
+}
+
+// =====================================================================
+//  Marching Cubes implementation
+// =====================================================================
+
+/**
+ * Marching Cubes isosurface extraction.
+ * Generates triangle vertices + gradient-based normals directly into arrays.
+ */
+function marchingCubes(
+  field: Float32Array,
+  fnx: number, fny: number, fnz: number,
+  iso: number,
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+  positions: number[],
+  normals: number[],
+  addColor: (z: number) => void
+): void {
+  // For each cube (8 corners from the scalar field)
+  for (let iz = 0; iz < fnz - 1; iz++) {
+    for (let iy = 0; iy < fny - 1; iy++) {
+      for (let ix = 0; ix < fnx - 1; ix++) {
+        // Get 8 corner values
+        const v0 = field[idx(ix,   iy,   iz,   fnx, fny)];
+        const v1 = field[idx(ix+1, iy,   iz,   fnx, fny)];
+        const v2 = field[idx(ix+1, iy+1, iz,   fnx, fny)];
+        const v3 = field[idx(ix,   iy+1, iz,   fnx, fny)];
+        const v4 = field[idx(ix,   iy,   iz+1, fnx, fny)];
+        const v5 = field[idx(ix+1, iy,   iz+1, fnx, fny)];
+        const v6 = field[idx(ix+1, iy+1, iz+1, fnx, fny)];
+        const v7 = field[idx(ix,   iy+1, iz+1, fnx, fny)];
+
+        // Compute cube index (which corners are inside)
+        let cubeIdx = 0;
+        if (v0 >= iso) cubeIdx |= 1;
+        if (v1 >= iso) cubeIdx |= 2;
+        if (v2 >= iso) cubeIdx |= 4;
+        if (v3 >= iso) cubeIdx |= 8;
+        if (v4 >= iso) cubeIdx |= 16;
+        if (v5 >= iso) cubeIdx |= 32;
+        if (v6 >= iso) cubeIdx |= 64;
+        if (v7 >= iso) cubeIdx |= 128;
+
+        if (cubeIdx === 0 || cubeIdx === 255) continue;
+
+        const edges = MC_EDGE_TABLE[cubeIdx];
+        if (edges === 0) continue;
+
+        // World coordinates of cube origin
+        const cx = ox + ix * dx;
+        const cy = oy + iy * dy;
+        const cz = oz + iz * dz;
+
+        // Interpolate edge vertices
+        const edgeVerts: number[][] = new Array(12);
+        if (edges & 1)    edgeVerts[0]  = interpEdge(cx,      cy,      cz,      cx + dx, cy,      cz,      v0, v1, iso);
+        if (edges & 2)    edgeVerts[1]  = interpEdge(cx + dx, cy,      cz,      cx + dx, cy + dy, cz,      v1, v2, iso);
+        if (edges & 4)    edgeVerts[2]  = interpEdge(cx + dx, cy + dy, cz,      cx,      cy + dy, cz,      v2, v3, iso);
+        if (edges & 8)    edgeVerts[3]  = interpEdge(cx,      cy,      cz,      cx,      cy + dy, cz,      v0, v3, iso);
+        if (edges & 16)   edgeVerts[4]  = interpEdge(cx,      cy,      cz + dz, cx + dx, cy,      cz + dz, v4, v5, iso);
+        if (edges & 32)   edgeVerts[5]  = interpEdge(cx + dx, cy,      cz + dz, cx + dx, cy + dy, cz + dz, v5, v6, iso);
+        if (edges & 64)   edgeVerts[6]  = interpEdge(cx + dx, cy + dy, cz + dz, cx,      cy + dy, cz + dz, v6, v7, iso);
+        if (edges & 128)  edgeVerts[7]  = interpEdge(cx,      cy,      cz + dz, cx,      cy + dy, cz + dz, v4, v7, iso);
+        if (edges & 256)  edgeVerts[8]  = interpEdge(cx,      cy,      cz,      cx,      cy,      cz + dz, v0, v4, iso);
+        if (edges & 512)  edgeVerts[9]  = interpEdge(cx + dx, cy,      cz,      cx + dx, cy,      cz + dz, v1, v5, iso);
+        if (edges & 1024) edgeVerts[10] = interpEdge(cx + dx, cy + dy, cz,      cx + dx, cy + dy, cz + dz, v2, v6, iso);
+        if (edges & 2048) edgeVerts[11] = interpEdge(cx,      cy + dy, cz,      cx,      cy + dy, cz + dz, v3, v7, iso);
+
+        // Generate triangles
+        const tris = MC_TRI_TABLE[cubeIdx];
+        for (let t = 0; t < tris.length; t += 3) {
+          const a = edgeVerts[tris[t]];
+          const b = edgeVerts[tris[t + 1]];
+          const c = edgeVerts[tris[t + 2]];
+          if (!a || !b || !c) continue;
+
+          // Face normal from cross product
+          const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+          const acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
+          let nx = aby * acz - abz * acy;
+          let ny = abz * acx - abx * acz;
+          let nz = abx * acy - aby * acx;
+          const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+          nx /= nl; ny /= nl; nz /= nl;
+
+          positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+          normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
+          addColor(a[2]); addColor(b[2]); addColor(c[2]);
+        }
+      }
+    }
+  }
+}
+
+function idx(x: number, y: number, z: number, fnx: number, fny: number): number {
+  return z * fny * fnx + y * fnx + x;
+}
+
+function interpEdge(
+  x0: number, y0: number, z0: number,
+  x1: number, y1: number, z1: number,
+  v0: number, v1: number, iso: number
+): number[] {
+  const d = v1 - v0;
+  const t = Math.abs(d) > 1e-6 ? (iso - v0) / d : 0.5;
+  return [
+    x0 + t * (x1 - x0),
+    y0 + t * (y1 - y0),
+    z0 + t * (z1 - z0),
+  ];
+}
+
+// =====================================================================
+//  Shared helpers
+// =====================================================================
 
 function surfaceColor(
   colorMode: string, val: number, valMin: number, valRange: number
@@ -441,3 +321,63 @@ export function createToolpathLines(
   }
   return group;
 }
+
+// =====================================================================
+//  Marching Cubes lookup tables
+// =====================================================================
+
+/* eslint-disable */
+const MC_EDGE_TABLE: number[] = [
+  0x0,0x109,0x203,0x30a,0x406,0x50f,0x605,0x70c,0x80c,0x905,0xa0f,0xb06,0xc0a,0xd03,0xe09,0xf00,
+  0x190,0x99,0x393,0x29a,0x596,0x49f,0x795,0x69c,0x99c,0x895,0xb9f,0xa96,0xd9a,0xc93,0xf99,0xe90,
+  0x230,0x339,0x33,0x13a,0x636,0x73f,0x435,0x53c,0xa3c,0xb35,0x83f,0x936,0xe3a,0xf33,0xc39,0xd30,
+  0x3a0,0x2a9,0x1a3,0xaa,0x7a6,0x6af,0x5a5,0x4ac,0xbac,0xaa5,0x9af,0x8a6,0xfaa,0xea3,0xda9,0xca0,
+  0x460,0x569,0x663,0x76a,0x66,0x16f,0x265,0x36c,0xc6c,0xd65,0xe6f,0xf66,0x86a,0x963,0xa69,0xb60,
+  0x5f0,0x4f9,0x7f3,0x6fa,0x1f6,0xff,0x3f5,0x2fc,0xdfc,0xcf5,0xfff,0xef6,0x9fa,0x8f3,0xbf9,0xaf0,
+  0x650,0x759,0x453,0x55a,0x256,0x35f,0x55,0x15c,0xe5c,0xf55,0xc5f,0xd56,0xa5a,0xb53,0x859,0x950,
+  0x7c0,0x6c9,0x5c3,0x4ca,0x3c6,0x2cf,0x1c5,0xcc,0xfcc,0xec5,0xdcf,0xcc6,0xbca,0xac3,0x9c9,0x8c0,
+  0x8c0,0x9c9,0xac3,0xbca,0xcc6,0xdcf,0xec5,0xfcc,0xcc,0x1c5,0x2cf,0x3c6,0x4ca,0x5c3,0x6c9,0x7c0,
+  0x950,0x859,0xb53,0xa5a,0xd56,0xc5f,0xf55,0xe5c,0x15c,0x55,0x35f,0x256,0x55a,0x453,0x759,0x650,
+  0xaf0,0xbf9,0x8f3,0x9fa,0xef6,0xfff,0xcf5,0xdfc,0x2fc,0x3f5,0xff,0x1f6,0x6fa,0x7f3,0x4f9,0x5f0,
+  0xb60,0xa69,0x963,0x86a,0xf66,0xe6f,0xd65,0xc6c,0x36c,0x265,0x16f,0x66,0x76a,0x663,0x569,0x460,
+  0xca0,0xda9,0xea3,0xfaa,0x8a6,0x9af,0xaa5,0xbac,0x4ac,0x5a5,0x6af,0x7a6,0xaa,0x1a3,0x2a9,0x3a0,
+  0xd30,0xc39,0xf33,0xe3a,0x936,0x83f,0xb35,0xa3c,0x53c,0x435,0x73f,0x636,0x13a,0x33,0x339,0x230,
+  0xe90,0xf99,0xc93,0xd9a,0xa96,0xb9f,0x895,0x99c,0x69c,0x795,0x49f,0x596,0x29a,0x393,0x99,0x190,
+  0xf00,0xe09,0xd03,0xc0a,0xb06,0xa0f,0x905,0x80c,0x70c,0x605,0x50f,0x406,0x30a,0x203,0x109,0x0
+];
+
+const MC_TRI_TABLE: number[][] = [
+  [],[0,8,3],[0,1,9],[1,8,3,9,8,1],[1,2,10],[0,8,3,1,2,10],[9,2,10,0,2,9],[2,8,3,2,10,8,10,9,8],
+  [3,11,2],[0,11,2,8,11,0],[1,9,0,2,3,11],[1,11,2,1,9,11,9,8,11],[3,10,1,11,10,3],[0,10,1,0,8,10,8,11,10],[3,9,0,3,11,9,11,10,9],[9,8,10,10,8,11],
+  [4,7,8],[4,3,0,7,3,4],[0,1,9,8,4,7],[4,1,9,4,7,1,7,3,1],[1,2,10,8,4,7],[3,4,7,3,0,4,1,2,10],[9,2,10,9,0,2,8,4,7],[2,10,9,2,9,7,2,7,3,7,9,4],
+  [8,4,7,3,11,2],[11,4,7,11,2,4,2,0,4],[9,0,1,8,4,7,2,3,11],[4,7,11,9,4,11,9,11,2,9,2,1],[3,10,1,3,11,10,7,8,4],[1,11,10,1,4,11,1,0,4,7,11,4],[4,7,8,9,0,11,9,11,10,11,0,3],[4,7,11,4,11,9,9,11,10],
+  [9,5,4],[9,5,4,0,8,3],[0,5,4,1,5,0],[8,5,4,8,3,5,3,1,5],[1,2,10,9,5,4],[3,0,8,1,2,10,4,9,5],[5,2,10,5,4,2,4,0,2],[2,10,5,3,2,5,3,5,4,3,4,8],
+  [9,5,4,2,3,11],[0,11,2,0,8,11,4,9,5],[0,5,4,0,1,5,2,3,11],[2,1,5,2,5,8,2,8,11,4,8,5],[10,3,11,10,1,3,9,5,4],[4,9,5,0,8,1,8,10,1,8,11,10],[5,4,0,5,0,11,5,11,10,11,0,3],[5,4,8,5,8,10,10,8,11],
+  [9,7,8,5,7,9],[9,3,0,9,5,3,5,7,3],[0,7,8,0,1,7,1,5,7],[1,5,3,3,5,7],[9,7,8,9,5,7,10,1,2],[10,1,2,9,5,0,5,3,0,5,7,3],[8,0,2,8,2,5,8,5,7,10,5,2],[2,10,5,2,5,3,3,5,7],
+  [7,9,5,7,8,9,3,11,2],[9,5,7,9,7,2,9,2,0,2,7,11],[2,3,11,0,1,8,1,7,8,1,5,7],[11,2,1,11,1,7,7,1,5],[9,5,8,8,5,7,10,1,3,10,3,11],[5,7,0,5,0,9,7,11,0,1,0,10,11,10,0],[11,10,0,11,0,3,10,5,0,8,0,7,5,7,0],[11,10,5,7,11,5],
+  [10,6,5],[0,8,3,5,10,6],[9,0,1,5,10,6],[1,8,3,1,9,8,5,10,6],[1,6,5,2,6,1],[1,6,5,1,2,6,3,0,8],[9,6,5,9,0,6,0,2,6],[5,9,8,5,8,2,5,2,6,3,2,8],
+  [2,3,11,10,6,5],[11,0,8,11,2,0,10,6,5],[0,1,9,2,3,11,5,10,6],[5,10,6,1,9,2,9,11,2,9,8,11],[6,3,11,6,5,3,5,1,3],[0,8,11,0,11,5,0,5,1,5,11,6],[3,11,6,0,3,6,0,6,5,0,5,9],[6,5,9,6,9,11,11,9,8],
+  [5,10,6,4,7,8],[4,3,0,4,7,3,6,5,10],[1,9,0,5,10,6,8,4,7],[10,6,5,1,9,7,1,7,3,7,9,4],[6,1,2,6,5,1,4,7,8],[1,2,5,5,2,6,3,0,4,3,4,7],[8,4,7,9,0,5,0,6,5,0,2,6],[7,3,9,7,9,4,3,2,9,5,9,6,2,6,9],
+  [3,11,2,7,8,4,10,6,5],[5,10,6,4,7,2,4,2,0,2,7,11],[0,1,9,4,7,8,2,3,11,5,10,6],[9,2,1,9,11,2,9,4,11,7,11,4,5,10,6],[8,4,7,3,11,5,3,5,1,5,11,6],[5,1,11,5,11,6,1,0,11,7,11,4,0,4,11],[0,5,9,0,6,5,0,3,6,11,6,3,8,4,7],[6,5,9,6,9,11,4,7,9,7,11,9],
+  [10,4,9,6,4,10],[4,10,6,4,9,10,0,8,3],[10,0,1,10,6,0,6,4,0],[8,3,1,8,1,6,8,6,4,6,1,10],[1,4,9,1,2,4,2,6,4],[3,0,8,1,2,4,2,6,4,4,2,9 /*fix*/],[0,2,4,4,2,6],[8,3,2,8,2,4,4,2,6],
+  [10,4,9,10,6,4,11,2,3],[0,8,2,2,8,11,4,9,10,4,10,6],[3,11,2,0,1,6,0,6,4,6,1,10],[6,4,1,6,1,10,4,8,1,2,1,11,8,11,1],[9,6,4,9,3,6,9,1,3,11,6,3],[8,11,1,8,1,0,11,6,1,9,1,4,6,4,1],[3,11,6,3,6,0,0,6,4],[6,4,8,11,6,8],
+  [7,10,6,7,8,10,8,9,10],[0,7,3,0,10,7,0,9,10,6,7,10],[10,6,7,1,10,7,1,7,8,1,8,0],[10,6,7,10,7,1,1,7,3],[1,2,6,1,6,8,1,8,9,8,6,7],[2,6,9,2,9,1,6,7,9,0,9,3,7,3,9],[7,8,0,7,0,6,6,0,2],[7,3,2,6,7,2],
+  [2,3,11,10,6,8,10,8,9,8,6,7],[2,0,7,2,7,11,0,9,7,6,7,10,9,10,7],[1,8,0,1,7,8,1,10,7,6,7,10,2,3,11],[11,2,1,11,1,7,10,6,1,6,7,1],[8,9,6,8,6,7,9,1,6,11,6,3,1,3,6],[0,9,1,11,6,7],[7,8,0,7,0,6,3,11,0,11,6,0],[7,11,6],
+  [7,6,11],[3,0,8,11,7,6],[0,1,9,11,7,6],[8,1,9,8,3,1,11,7,6],[10,1,2,6,11,7],[1,2,10,3,0,8,6,11,7],[2,9,0,2,10,9,6,11,7],[6,11,7,2,10,3,10,8,3,10,9,8],
+  [7,2,3,6,2,7],[7,0,8,7,6,0,6,2,0],[2,7,6,2,3,7,0,1,9],[1,6,2,1,8,6,1,9,8,8,7,6],[10,7,6,10,1,7,1,3,7],[10,7,6,1,7,10,1,8,7,1,0,8],[0,3,7,0,7,10,0,10,9,6,10,7],[7,6,10,7,10,8,8,10,9],
+  [6,8,4,11,8,6],[3,6,11,3,0,6,0,4,6],[8,6,11,8,4,6,9,0,1],[9,4,6,9,6,3,9,3,1,11,3,6],[6,8,4,6,11,8,2,10,1],[1,2,10,3,0,11,0,6,11,0,4,6],[4,11,8,4,6,11,0,2,9,2,10,9],[10,9,3,10,3,2,9,4,3,11,3,6,4,6,3],
+  [8,2,3,8,4,2,4,6,2],[0,4,2,4,6,2],[1,9,0,2,3,4,2,4,6,4,3,8],[1,9,4,1,4,2,2,4,6],[8,1,3,8,6,1,8,4,6,6,10,1],[10,1,0,10,0,6,6,0,4],[4,6,3,4,3,8,6,10,3,0,3,9,10,9,3],[10,9,4,6,10,4],
+  [4,9,5,7,6,11],[0,8,3,4,9,5,11,7,6],[5,0,1,5,4,0,7,6,11],[11,7,6,8,3,4,3,5,4,3,1,5],[9,5,4,10,1,2,7,6,11],[6,11,7,1,2,10,0,8,3,4,9,5],[7,6,11,5,4,10,4,2,10,4,0,2],[3,4,8,3,5,4,3,2,5,10,5,2,11,7,6],
+  [7,2,3,7,6,2,5,4,9],[9,5,4,0,8,6,0,6,2,6,8,7],[3,6,2,3,7,6,1,5,0,5,4,0],[6,2,8,6,8,7,2,1,8,4,8,5,1,5,8],[9,5,4,10,1,6,1,7,6,1,3,7],[1,6,10,1,7,6,1,0,7,8,7,0,9,5,4],[4,0,10,4,10,5,0,3,10,6,10,7,3,7,10],[7,6,10,7,10,8,5,4,10,4,8,10],
+  [6,9,5,6,11,9,11,8,9],[3,6,11,0,6,3,0,5,6,0,9,5],[0,11,8,0,5,11,0,1,5,5,6,11],[6,11,3,6,3,5,5,3,1],[1,2,10,9,5,11,9,11,8,11,5,6],[0,11,3,0,6,11,0,9,6,5,6,9,1,2,10],[11,8,5,11,5,6,8,0,5,10,5,2,0,2,5],[6,11,3,6,3,5,2,10,3,10,5,3],
+  [5,8,9,5,2,8,5,6,2,3,8,2],[9,5,6,9,6,0,0,6,2],[1,5,8,1,8,0,5,6,8,3,8,2,6,2,8],[1,5,6,2,1,6],[1,3,6,1,6,10,3,8,6,5,6,9,8,9,6],[10,1,0,10,0,6,9,5,0,5,6,0],[0,3,8,5,6,10],[10,5,6],
+  [11,5,10,7,5,11],[11,5,10,11,7,5,8,3,0],[5,11,7,5,10,11,1,9,0],[10,7,5,10,11,7,9,8,1,8,3,1],[11,1,2,11,7,1,7,5,1],[0,8,3,1,2,7,1,7,5,7,2,11],[9,7,5,9,2,7,9,0,2,2,11,7],[7,5,2,7,2,11,5,9,2,3,2,8,9,8,2],
+  [2,5,10,2,3,5,3,7,5],[8,2,0,8,5,2,8,7,5,10,2,5],[9,0,1,5,10,3,5,3,7,3,10,2],[9,8,2,9,2,1,8,7,2,10,2,5,7,5,2],[1,3,5,3,7,5],[0,8,7,0,7,1,1,7,5],[9,0,3,9,3,5,5,3,7],[9,8,7,5,9,7],
+  [5,8,4,5,10,8,10,11,8],[5,0,4,5,11,0,5,10,11,11,3,0],[0,1,9,8,4,10,8,10,11,10,4,5],[10,11,4,10,4,5,11,3,4,9,4,1,3,1,4],[2,5,1,2,8,5,2,11,8,4,5,8],[0,4,11,0,11,3,4,5,11,2,11,1,5,1,11],[0,2,5,0,5,9,2,11,5,4,5,8,11,8,5],[9,4,5,2,11,3],
+  [2,5,10,3,5,2,3,4,5,3,8,4],[5,10,2,5,2,4,4,2,0],[3,10,2,3,5,10,3,8,5,4,5,8,0,1,9],[5,10,2,5,2,4,1,9,2,9,4,2],[8,4,5,8,5,3,3,5,1],[0,4,5,1,0,5],[8,4,5,8,5,3,9,0,5,0,3,5],[9,4,5],
+  [4,11,7,4,9,11,9,10,11],[0,8,3,4,9,7,9,11,7,9,10,11],[1,10,11,1,11,4,1,4,0,7,4,11],[3,1,4,3,4,8,1,10,4,7,4,11,10,11,4],[4,11,7,9,11,4,9,2,11,9,1,2],[9,7,4,9,11,7,9,1,11,2,11,1,0,8,3],[11,7,4,11,4,2,2,4,0],[11,7,4,11,4,2,8,3,4,3,2,4],
+  [2,9,10,2,7,9,2,3,7,7,4,9],[9,10,7,9,7,4,10,2,7,8,7,0,2,0,7],[3,7,10,3,10,2,7,4,10,1,10,0,4,0,10],[1,10,2,8,7,4],[4,9,1,4,1,7,7,1,3],[4,9,1,4,1,7,0,8,1,8,7,1],[4,0,3,7,4,3],[4,8,7],
+  [9,10,8,10,11,8],[3,0,9,3,9,11,11,9,10],[0,1,10,0,10,8,8,10,11],[3,1,10,11,3,10],[1,2,11,1,11,9,9,11,8],[3,0,9,3,9,11,1,2,9,2,11,9],[0,2,11,8,0,11],[3,2,11],
+  [2,3,8,2,8,10,10,8,9],[9,10,2,0,9,2],[2,3,8,2,8,10,0,1,8,1,10,8],[1,10,2],[1,3,8,9,1,8],[0,9,1,8,3,0 /*fix*/],[0,3,8],[],
+];
+/* eslint-enable */
