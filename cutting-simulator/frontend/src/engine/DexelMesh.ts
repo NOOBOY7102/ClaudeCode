@@ -5,9 +5,10 @@ import { DexelModel } from './DexelModel';
  * Tri-Dexel → smooth mesh via Marching Cubes.
  *
  * 1. Sample the tri-dexel (Z/X/Y grids) into a 3D scalar field.
- *    Each voxel stores the fraction of dexel rays that report "inside material".
- * 2. Run Marching Cubes on the scalar field (iso = 0.5) to extract a smooth surface.
- * 3. Compute gradient-based normals from the scalar field for smooth shading.
+ *    Each voxel vertex stores a signed-distance-like value: distance to
+ *    nearest dexel segment boundary, positive inside, negative outside.
+ * 2. Run Marching Cubes on the scalar field (iso = 0) to extract surface.
+ * 3. Compute gradient-based smooth normals from the scalar field.
  */
 
 // =====================================================================
@@ -19,17 +20,13 @@ export function dexelToMesh(
   _targetModel?: DexelModel
 ): THREE.BufferGeometry {
   const { bbox, resolution: dcs } = model;
-  // Use coarser MC grid for performance (2x dexel resolution)
-  const MC_SCALE = 2;
-  const cs = dcs * MC_SCALE;
+  // MC grid matches dexel resolution (no scaling down)
+  const cs = dcs;
   // Add 1-cell padding so MC finds the bbox boundary surface
   const PAD = 1;
-  const mcNx = Math.ceil(model.nx / MC_SCALE);
-  const mcNy = Math.ceil(model.ny / MC_SCALE);
-  const mcNz = Math.ceil(model.nz / MC_SCALE);
-  const fnx = mcNx + 1 + 2 * PAD;
-  const fny = mcNy + 1 + 2 * PAD;
-  const fnz = mcNz + 1 + 2 * PAD;
+  const fnx = model.nx + 1 + 2 * PAD;
+  const fny = model.ny + 1 + 2 * PAD;
+  const fnz = model.nz + 1 + 2 * PAD;
   const ox = bbox.minX - PAD * cs;
   const oy = bbox.minY - PAD * cs;
   const oz = bbox.minZ - PAD * cs;
@@ -51,7 +48,7 @@ export function dexelToMesh(
 
   marchingCubes(
     field, fnx, fny, fnz,
-    0.5, // iso level
+    0.0, // iso level (signed distance: 0 = surface)
     ox, oy, oz,
     cs, cs, cs,
     positions, normals,
@@ -60,6 +57,9 @@ export function dexelToMesh(
       colors.push(c[0], c[1], c[2]);
     }
   );
+
+  // Compute gradient-based smooth normals from scalar field
+  computeGradientNormals(field, fnx, fny, fnz, ox, oy, oz, cs, positions, normals);
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
@@ -74,9 +74,12 @@ export function dexelToMesh(
 // =====================================================================
 
 /**
- * Sample the tri-dexel model into a 3D scalar field.
- * For each grid vertex, query each dexel grid for inside/outside.
- * Majority vote (>=2 of 3) → solid.
+ * Sample the tri-dexel model into a 3D scalar field with signed-distance-like values.
+ *
+ * For each MC vertex, query all 3 dexel grids. Each grid produces a signed distance
+ * along its ray axis (positive = inside, negative = outside, clamped to ±halfCell).
+ * The final field value is the min of valid signed distances (intersection).
+ * Out-of-bounds grids are excluded from the min so they don't create false holes.
  */
 function sampleTriDexelField(
   model: DexelModel,
@@ -86,7 +89,9 @@ function sampleTriDexelField(
   cs: number
 ): void {
   const { bbox } = model;
+  const dcs = model.resolution; // dexel cell size for grid index lookups
   const { nx, ny, nz } = model;
+  const halfCs = cs * 0.5; // clamp distance to half a MC cell
 
   for (let iz = 0; iz < fnz; iz++) {
     const wz = oz + iz * cs;
@@ -96,44 +101,148 @@ function sampleTriDexelField(
         const wx = ox + ix * cs;
         const fi = iz * fny * fnx + iy * fnx + ix;
 
-        let votes = 0;
+        let result = -halfCs; // default: outside (for padding cells)
+        let validCount = 0;
 
-        // Z-grid: column at (wx, wy), check if wz is inside
-        const zix = Math.floor((wx - bbox.minX) / cs);
-        const ziy = Math.floor((wy - bbox.minY) / cs);
+        // Z-grid: column at (wx, wy), signed distance along Z
+        const zix = Math.floor((wx - bbox.minX) / dcs);
+        const ziy = Math.floor((wy - bbox.minY) / dcs);
         if (zix >= 0 && zix < nx && ziy >= 0 && ziy < ny) {
           const zSegs = model.zGrid.segments[ziy * nx + zix];
-          if (isInsideSegments(zSegs, wz)) votes++;
+          const dZ = signedDistanceToSegments(zSegs, wz, halfCs);
+          if (validCount === 0) result = dZ; else result = Math.min(result, dZ);
+          validCount++;
         }
 
-        // X-grid: column at (wy, wz), check if wx is inside
-        const xiy = Math.floor((wy - bbox.minY) / cs);
-        const xiz = Math.floor((wz - bbox.minZ) / cs);
+        // X-grid: column at (wy, wz), signed distance along X
+        const xiy = Math.floor((wy - bbox.minY) / dcs);
+        const xiz = Math.floor((wz - bbox.minZ) / dcs);
         if (xiy >= 0 && xiy < ny && xiz >= 0 && xiz < nz) {
           const xSegs = model.xGrid.segments[xiz * ny + xiy];
-          if (isInsideSegments(xSegs, wx)) votes++;
+          const dX = signedDistanceToSegments(xSegs, wx, halfCs);
+          if (validCount === 0) result = dX; else result = Math.min(result, dX);
+          validCount++;
         }
 
-        // Y-grid: column at (wx, wz), check if wy is inside
-        const yix = Math.floor((wx - bbox.minX) / cs);
-        const yiz = Math.floor((wz - bbox.minZ) / cs);
+        // Y-grid: column at (wx, wz), signed distance along Y
+        const yix = Math.floor((wx - bbox.minX) / dcs);
+        const yiz = Math.floor((wz - bbox.minZ) / dcs);
         if (yix >= 0 && yix < nx && yiz >= 0 && yiz < nz) {
           const ySegs = model.yGrid.segments[yiz * nx + yix];
-          if (isInsideSegments(ySegs, wy)) votes++;
+          const dY = signedDistanceToSegments(ySegs, wy, halfCs);
+          if (validCount === 0) result = dY; else result = Math.min(result, dY);
+          validCount++;
         }
 
-        field[fi] = votes >= 2 ? 1.0 : 0.0;
+        field[fi] = result;
       }
     }
   }
 }
 
-/** Check if value t is inside any segment pair [start, end, start, end, ...] */
-function isInsideSegments(segs: Float32Array, t: number): boolean {
+/**
+ * Compute signed distance from point t to the nearest segment boundary.
+ * Positive = inside material, Negative = outside material.
+ * Clamped to ±maxDist for numerical stability.
+ */
+function signedDistanceToSegments(segs: Float32Array, t: number, maxDist: number): number {
+  if (segs.length === 0) return -maxDist;
+
+  let minOutsideDist = maxDist; // nearest boundary when outside
+  let minInsideDist = maxDist;  // nearest boundary when inside
+  let inside = false;
+
   for (let i = 0; i < segs.length; i += 2) {
-    if (t >= segs[i] && t <= segs[i + 1]) return true;
+    const s = segs[i];
+    const e = segs[i + 1];
+    if (t >= s && t <= e) {
+      inside = true;
+      // Distance to nearest segment boundary
+      const d = Math.min(t - s, e - t);
+      if (d < minInsideDist) minInsideDist = d;
+    } else {
+      // Distance to nearest segment endpoint
+      const d = t < s ? s - t : t - e;
+      if (d < minOutsideDist) minOutsideDist = d;
+    }
   }
-  return false;
+
+  if (inside) {
+    return Math.min(minInsideDist, maxDist);
+  } else {
+    return -Math.min(minOutsideDist, maxDist);
+  }
+}
+
+/**
+ * Replace face normals with gradient-based smooth normals from the scalar field.
+ * For each vertex, compute the gradient of the field using central differences.
+ */
+function computeGradientNormals(
+  field: Float32Array,
+  fnx: number, fny: number, fnz: number,
+  ox: number, oy: number, oz: number,
+  cs: number,
+  positions: number[],
+  normals: number[]
+): void {
+  const vertCount = positions.length / 3;
+  for (let v = 0; v < vertCount; v++) {
+    const px = positions[v * 3];
+    const py = positions[v * 3 + 1];
+    const pz = positions[v * 3 + 2];
+
+    // Convert world position to field-space fractional index
+    const fx = (px - ox) / cs;
+    const fy = (py - oy) / cs;
+    const fz = (pz - oz) / cs;
+
+    // Sample field gradient via central differences
+    const gx = sampleField(field, fnx, fny, fnz, fx + 0.5, fy, fz)
+             - sampleField(field, fnx, fny, fnz, fx - 0.5, fy, fz);
+    const gy = sampleField(field, fnx, fny, fnz, fx, fy + 0.5, fz)
+             - sampleField(field, fnx, fny, fnz, fx, fy - 0.5, fz);
+    const gz = sampleField(field, fnx, fny, fnz, fx, fy, fz + 0.5)
+             - sampleField(field, fnx, fny, fnz, fx, fy, fz - 0.5);
+
+    // Gradient points from low to high → outward normal is -gradient
+    const len = Math.sqrt(gx * gx + gy * gy + gz * gz) || 1;
+    normals[v * 3]     = -gx / len;
+    normals[v * 3 + 1] = -gy / len;
+    normals[v * 3 + 2] = -gz / len;
+  }
+}
+
+/** Trilinear sample of the scalar field at fractional indices */
+function sampleField(
+  field: Float32Array, fnx: number, fny: number, fnz: number,
+  fx: number, fy: number, fz: number
+): number {
+  const ix0 = Math.max(0, Math.min(fnx - 2, Math.floor(fx)));
+  const iy0 = Math.max(0, Math.min(fny - 2, Math.floor(fy)));
+  const iz0 = Math.max(0, Math.min(fnz - 2, Math.floor(fz)));
+  const tx = fx - ix0, ty = fy - iy0, tz = fz - iz0;
+
+  const i000 = iz0 * fny * fnx + iy0 * fnx + ix0;
+  const i100 = i000 + 1;
+  const i010 = i000 + fnx;
+  const i110 = i010 + 1;
+  const step = fny * fnx;
+  const i001 = i000 + step;
+  const i101 = i100 + step;
+  const i011 = i010 + step;
+  const i111 = i110 + step;
+
+  return (
+    field[i000] * (1 - tx) * (1 - ty) * (1 - tz) +
+    field[i100] * tx       * (1 - ty) * (1 - tz) +
+    field[i010] * (1 - tx) * ty       * (1 - tz) +
+    field[i110] * tx       * ty       * (1 - tz) +
+    field[i001] * (1 - tx) * (1 - ty) * tz +
+    field[i101] * tx       * (1 - ty) * tz +
+    field[i011] * (1 - tx) * ty       * tz +
+    field[i111] * tx       * ty       * tz
+  );
 }
 
 // =====================================================================
